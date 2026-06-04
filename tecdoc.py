@@ -58,6 +58,7 @@ _LANG_BY_METHOD = {
     "getCars": LANG_ID,
     "getSearchTree": LANG_ID,
     "getArticles": LANG_ID,
+    "getArticle": LANG_ID,
 }
 
 # carType-строка для getMakes/getModels/getCars (резервный путь).
@@ -87,6 +88,9 @@ _KEY_ENV = {
     "getCars": "PARTSAPI_KEY_CARS",
     "getSearchTree": "PARTSAPI_KEY_TREE",
     "getArticles": "PARTSAPI_KEY_ARTICLES",
+    # getArticle (ед. число) — детали по ОДНОМУ артикулу: OEM-номера, точное
+    # название, характеристики (высота/диаметр/резьба), чем заменён. Свой ключ.
+    "getArticle": "PARTSAPI_KEY_GETARTICLE",
 }
 
 # Пытаемся прочитать ключи сразу при импорте. НО если import tecdoc
@@ -315,11 +319,60 @@ def _norm(s: Any) -> str:
 
 
 def _year(v: Any) -> Optional[int]:
-    """Достаёт 4-значный год из строки/числа (yearOfConstrFrom, yearStart и т.п.)."""
+    """Достаёт 4-значный год из стро��������и/числа (yearOfConstrFrom, yearStart и т.п.)."""
     if v is None:
         return None
     m = re.search(r"(19|20)\d{2}", str(v))
     return int(m.group(0)) if m else None
+
+
+def _all_objs(data: Any) -> list:
+    """Все словари-объекты из ответа (list / dict / обёртки items/result/...).
+    В отличие от _first_obj возвращает ВСЕ варианты — нужно Слою 1, когда
+    VINdecode отдаёт несколько модификаций авто (разные двигатели)."""
+    if isinstance(data, list):
+        return [it for it in data if isinstance(it, dict)]
+    if isinstance(data, dict):
+        for k in ("items", "data", "result", "results", "list"):
+            v = data.get(k)
+            if isinstance(v, list):
+                objs = [it for it in v if isinstance(it, dict)]
+                if objs:
+                    return objs
+            if isinstance(v, dict):
+                objs = [vv for vv in v.values() if isinstance(vv, dict)]
+                if objs:
+                    return objs
+        return [data]
+    return []
+
+
+def _engine_code(info: Any) -> Optional[str]:
+    """Код двигателя из VINdecode (motorCode/engineCode/...), нормализованный.
+    Если пришёл список 'AEB, ANB' — берём первый."""
+    if not isinstance(info, dict):
+        return None
+    raw = _pick(info, "motorCode", "engineCode", "motor", "engine",
+                "motorCodes", "engineCodes", "kod_dvigatelya", "engineNumber")
+    if not raw:
+        return None
+    first = re.split(r"[,;/ ]+", str(raw).strip())[0]
+    return _norm(first) or None
+
+
+def _pick_car_by_engine(objs: list, engine_code: Optional[str]) -> Optional[int]:
+    """Слой 1: из вариантов авто выбирает carId, чей код двигателя совпадает с
+    engine_code. Нет совпадений / код неизвестен -> None (вызывающий код берёт
+    первый carId, поведение как раньше — безопасно)."""
+    if not engine_code:
+        return None
+    for o in objs:
+        if not isinstance(o, dict):
+            continue
+        cid = _to_int(_pick(o, "carId", "carID", "car_id"))
+        if cid and _engine_code(o) == engine_code:
+            return cid
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -493,13 +546,13 @@ async def resolve_car_id(session, vin: str) -> dict:
     """Главная точка: VIN -> carId.
 
     Основной путь: VINdecode(vin) -> carId напрямую.
-    Резерв (make/model/cars) — только если VINdecode не дал carId,
+    Резерв (make/model/cars) — только если VINdecode н�� дал carId,
     включён флагом USE_MAKE_MODEL_FALLBACK И бот не под нагрузкой (_under_load).
 
     Возвращает {"car_id", "source", "candidates", "car_str", "brand"}.
     """
     out = {"car_id": None, "source": None, "candidates": [],
-           "car_str": None, "brand": None}
+           "car_str": None, "brand": None, "engine_code": None}
 
     brand = modely = type_name = None
     manu_id = mod_id = None
@@ -507,9 +560,9 @@ async def resolve_car_id(session, vin: str) -> dict:
 
     vd = await vindecode(session, vin)
     if vd.get("_ok"):
-        info = _first_obj(vd["data"])
+        objs = _all_objs(vd["data"])
+        info = objs[0] if objs else None
         if isinstance(info, dict):
-            car_id = _to_int(_pick(info, "carId", "carID", "car_id"))
             manu_id = _to_int(_pick(info, "manuId", "makeId"))
             mod_id = _to_int(_pick(info, "modId", "modelId"))
             brand = _pick(info, "manuName", "makeName", "brand", "brend")
@@ -517,10 +570,25 @@ async def resolve_car_id(session, vin: str) -> dict:
             type_name = _pick(info, "typeName", "carName")
             year = _year(_pick(info, "yearOfConstrFrom", "yearOfConstr",
                                "year", "god", "data_vypuska"))
+            engine_code = _engine_code(info)
+            out["engine_code"] = engine_code
             car_str = " ".join(str(x) for x in (brand, modely, type_name) if x) or None
 
+            # все варианты авто с carId (VINdecode иногда отдаёт несколько
+            # модификаций — различаются кодом двигателя)
+            cand = []
+            for o in objs:
+                cid = _to_int(_pick(o, "carId", "carID", "car_id"))
+                if cid and cid not in cand:
+                    cand.append(cid)
+
+            # Слой 1: если вариантов несколько — берём по коду двигателя,
+            # иначе первый carId (как раньше).
+            car_id = _pick_car_by_engine(objs, engine_code) \
+                or _to_int(_pick(info, "carId", "carID", "car_id"))
+
             if car_id:
-                out.update({"car_id": car_id, "candidates": [car_id],
+                out.update({"car_id": car_id, "candidates": cand or [car_id],
                             "source": "VINdecode", "car_str": car_str,
                             "brand": brand or None})
                 return out
@@ -595,7 +663,7 @@ async def resolve_str_id(session, car_id: int, cat_id: str,
     """cat_id (+ part_name) -> strId дерева для данного авто.
 
     1) Явный CAT_TO_STR_ID имеет приоритет.
-    2) Иначе — матч названия узла по part_name/keywords (пересечение токенов).
+    2) Иначе — ма��ч названия узла по part_name/keywords (пересечение токенов).
     """
     if cat_id in CAT_TO_STR_ID:
         return CAT_TO_STR_ID[cat_id]
@@ -697,6 +765,386 @@ async def get_oem_articles(session, car_id: int, str_id: int) -> list:
     if not r.get("_ok"):
         return []
     return get_oem_articles_from_payload(r["data"])
+
+
+# ===========================================================================
+# getArticle (ед. число): OEM-номер + точное название + характеристики + замена
+# ---------------------------------------------------------------------------
+# Цель: показывать НЕ "все 261 подряд", а оригинальный OEM-номер и короткий
+# топ точно подходящих аналогов, с отсевом "не того" размера. Вход getArticle:
+# ART_NUM (= ART_ARTICLE_NR из getArticles), SUP_ID (= SUP_ID из getArticles),
+# LANG=16. Поэтому из getArticles нам нужен SUP_ID — его сохраняет
+# get_article_rows_from_payload (ниже), в отличие от "плоского" парсера выше.
+# ===========================================================================
+
+# Премиальные/ОЕ-бренды: их показываем в первую очередь. Можно переопределить
+# через .env PARTSAPI_PREMIUM_BRANDS="MANN,MAHLE,...".
+_DEFAULT_PREMIUM_BRANDS = (
+    "MANN,MANN-FILTER,MAHLE,KNECHT,BOSCH,HENGST,FILTRON,FEBI,FEBI BILSTEIN,"
+    "MEYLE,SACHS,LEMFORDER,LEMFÖRDER,TRW,ATE,VALEO,NGK,NTK,SKF,INA,LUK,"
+    "CONTITECH,GATES,ELRING,VICTOR REINZ,RUVILLE,VAICO,SWAG,UFI,PURFLUX,"
+    "BLUE PRINT,JAPANPARTS,DENSO,HELLA,BREMBO,TEXTAR,ZIMMERMANN"
+)
+PREMIUM_BRANDS = [
+    _norm(b) for b in os.getenv("PARTSAPI_PREMIUM_BRANDS", _DEFAULT_PREMIUM_BRANDS).split(",")
+    if b.strip()
+]
+
+
+def get_article_rows_from_payload(data: Any) -> list:
+    """Как get_oem_articles_from_payload, но СОХРАНЯЕТ sup_id/art_id (нужны для
+    getArticle). -> [{"brand","article","sup_id","art_id"}], дедуп по артикулу."""
+    out, seen = [], set()
+    for it in _as_list(data):
+        if not isinstance(it, dict):
+            continue
+        brand = _pick(it, "ART_SUP_BRAND", "brandName", "brand",
+                      "manuName", "supplierName")
+        art = _pick(it, "ART_ARTICLE_NR", "articleNumber", "article",
+                    "number", "oem")
+        if not brand or not art:
+            continue
+        key = (_norm(brand), _norm(art))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "brand": str(brand),
+            "article": str(art),
+            "sup_id": _pick(it, "SUP_ID", "supId", "supplierId", "ART_SUP_ID"),
+            "art_id": _pick(it, "ART_ID", "artId", "articleId"),
+        })
+    return out
+
+
+def _is_premium(brand: Any) -> bool:
+    nb = _norm(brand)
+    return any(nb == pb or (pb and pb in nb) for pb in PREMIUM_BRANDS)
+
+
+# OE-/премиум-«первый эшелон»: обогащаем в первую очередь, чтобы при малом
+# бюджете запросов (тест) попали именно авторитетные фильтр-бренды (MANN/MAHLE).
+# Переопределяется через .env PARTSAPI_OE_TIER_BRANDS.
+_DEFAULT_OE_TIER_BRANDS = ("MANN,MANN-FILTER,MAHLE,KNECHT,HENGST,BOSCH,FILTRON,"
+                           "UFI,PURFLUX,MEYLE,SOFIMA,WIX")
+OE_TIER_BRANDS = [
+    _norm(b) for b in os.getenv("PARTSAPI_OE_TIER_BRANDS",
+                                _DEFAULT_OE_TIER_BRANDS).split(",") if b.strip()
+]
+
+
+def _is_oe_tier(brand: Any) -> bool:
+    nb = _norm(brand)
+    return any(nb == pb or (pb and pb in nb) for pb in OE_TIER_BRANDS)
+
+
+def rank_article_rows(rows: list) -> list:
+    """Порядок обогащения: сначала OE-эшелон (MANN/MAHLE/...), затем прочие
+    премиальные, затем остальное. sorted стабильна — внутри эшелона
+    порядок исходный."""
+    def _tier(r):
+        b = r.get("brand")
+        return 0 if _is_oe_tier(b) else (1 if _is_premium(b) else 2)
+    return sorted(rows, key=_tier)
+
+
+def _as_text_list(v: Any) -> list:
+    """Любой вход (str / list[str] / list[dict] / dict) -> плоский список строк.
+    Для объектов вытаскивает номер (+бренд, если есть). Дедуп с сохранением
+    порядка."""
+    raw = []
+    if v is None:
+        return raw
+    if isinstance(v, str):
+        raw = [p.strip() for p in re.split(r"[,;\n]\s*", v) if p.strip()]
+    else:
+        items = v if isinstance(v, list) else ([v] if isinstance(v, dict) else [])
+        for it in items:
+            if isinstance(it, str):
+                if it.strip():
+                    raw.append(it.strip())
+            elif isinstance(it, dict):
+                num = _pick(it, "OEM_NR", "ARO_OEM_NR", "oemNr", "oemNumber",
+                            "number", "ARTICLE_OEM_NR", "value", "nr")
+                brand = _pick(it, "OEM_BRAND", "ARO_OEM_BRAND", "brandName",
+                              "mfrName", "brand", "manuName")
+                if num:
+                    raw.append(f"{brand} {num}".strip() if brand else str(num))
+    seen, res = set(), []
+    for x in raw:
+        k = _norm(x)
+        if k and k not in seen:
+            seen.add(k)
+            res.append(x)
+    return res
+
+
+def _extract_criteria(v: Any) -> dict:
+    """ARTICLE_CRITERIA -> {название: значение(+ед.)}. Терпим к разным ключам."""
+    crit: dict = {}
+    # partsapi реально отдаёт criteria СТРОКОЙ:
+    # "Высота [мм]: 79; Внешний диаметр [мм]: 76; Размер резьбы: M20 x 1.5; ..."
+    if isinstance(v, str):
+        for part in v.split(";"):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            name, val = part.split(":", 1)
+            name, val = name.strip(), val.strip()
+            if name and val:
+                crit[name] = val
+        return crit
+    items = v if isinstance(v, list) else ([v] if isinstance(v, dict) else [])
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = _pick(it, "CRITERIA_NAME", "CRI_DESCRIPTION", "criteriaName",
+                     "ACR_DESCRIPTION", "ART_CRITERIA_NAME", "name")
+        val = _pick(it, "CRITERIA_VALUE", "CRI_VALUE", "criteriaValue",
+                    "ACR_VALUE", "ART_CRITERIA_VALUE", "value")
+        unit = _pick(it, "CRITERIA_UNIT", "CRI_UNIT", "ACR_UNIT", "unit")
+        if name and val not in (None, ""):
+            txt = str(val)
+            if unit:
+                txt = f"{txt} {unit}".strip()
+            crit[str(name)] = txt
+    return crit
+
+
+def parse_article(data: Any) -> dict:
+    """Разбор ответа getArticle -> структурированные детали по артикулу.
+    Реальные ключи partsapi: OEM_NUMBERS, ART_PRODUCT_NAME, ARTICLE_CRITERIA,
+    'SUPERSEDED BY' (с пробелом!), EAN_NUMBERS, ART_STATUS_TEXT."""
+    obj = _first_obj(data) or {}
+    if not isinstance(obj, dict):
+        obj = {}
+    return {
+        "product_name": _pick(obj, "ART_PRODUCT_NAME", "productName",
+                              "GA_PRODUCT_NAME", "genericArticleName", "name") or "",
+        "oem_numbers": _as_text_list(_pick(obj, "OEM_NUMBERS", "oemNumbers",
+                              "OEM", "ART_OEM_NR", "oem")),
+        "criteria": _extract_criteria(_pick(obj, "ARTICLE_CRITERIA",
+                              "articleCriteria", "CRITERIA", "ART_CRITERIA")),
+        "superseded_by": _as_text_list(_pick(obj, "SUPERSEDED BY",
+                              "SUPERSEDED_BY", "supersededBy", "SUCCESSOR")),
+        "ean": _as_text_list(_pick(obj, "EAN_NUMBERS", "eanNumbers", "EAN")),
+        "status": _pick(obj, "ART_STATUS_TEXT", "statusText", "ART_STATUS") or "",
+    }
+
+
+async def get_article(session, art_num: str, sup_id: Any,
+                      *, use_cache: bool = True) -> dict:
+    """getArticle: детали ОДНОГО артикула. Вход ART_NUM + SUP_ID (+LANG).
+    Возвращает обычный _request-словарь {"_ok":True,"data":...} | {"_error":...}."""
+    if not art_num or sup_id in (None, ""):
+        return {"_error": "BAD_ARGS", "_method": "getArticle"}
+    return await _request(
+        session, "getArticle",
+        {"ART_NUM": art_num, "SUP_ID": sup_id,
+         "LANG": _LANG_BY_METHOD.get("getArticle", LANG_ID)},
+        use_cache=use_cache,
+    )
+
+
+async def get_article_details(session, art_num: str, sup_id: Any) -> Optional[dict]:
+    """getArticle -> распарсенные детали (parse_article) или None при ошибке."""
+    r = await get_article(session, art_num, sup_id)
+    if not r.get("_ok"):
+        return None
+    return parse_article(r["data"])
+
+
+async def enrich_articles_with_oem(session, rows: list, *, max_calls: int = 8,
+                                   premium_first: bool = True) -> list:
+    """Для топ-N строк (из get_article_rows_from_payload) тянет getArticle и
+    добавляет ключи oem_numbers/product_name/criteria/superseded_by. Остальные
+    строки возвращаются как есть (без деталей). max_calls бережёт лимит запросов."""
+    ordered = rank_article_rows(rows) if premium_first else list(rows)
+    enriched, calls = [], 0
+    for row in ordered:
+        row = dict(row)
+        if calls < max_calls and row.get("article") and row.get("sup_id") not in (None, ""):
+            details = await get_article_details(session, row["article"], row["sup_id"])
+            calls += 1
+            if details:
+                row.update({
+                    "oem_numbers": details["oem_numbers"],
+                    "product_name": details["product_name"],
+                    "criteria": details["criteria"],
+                    "superseded_by": details["superseded_by"],
+                })
+        enriched.append(row)
+    return enriched
+
+
+def build_oem_summary(enriched: list, *, top_n: int = 5,
+                      min_oem_support: int = 2) -> dict:
+    """Из обогащённых строк собирает компактную сводку для бота:
+        {"oem_numbers": [...],          # оригинальные номера, по частоте
+         "top": [{brand,article,product_name,criteria}],  # топ аналогов
+         "groups": {ключ_размера: [article,...]}}        # отсев "не того" размера
+    Группировка по ключевым характеристикам (высота/диаметр/резьба) помогает
+    различить два размера одной детали (напр. два масляных фильтра под 1.8T).
+    """
+    # 1) OEM-номера: считаем частоту по премиальным артикулам, сортируем по ней
+    freq: dict[str, int] = {}
+    label: dict[str, str] = {}
+    for r in enriched:
+        for oem in r.get("oem_numbers", []) or []:
+            k = _norm(oem)
+            if not k:
+                continue
+            freq[k] = freq.get(k, 0) + 1
+            label.setdefault(k, oem)
+    oem_sorted = [label[k] for k, _ in sorted(freq.items(),
+                  key=lambda kv: (-kv[1], kv[0]))]
+
+    # 2) ЯКОРЬ (Слой 2): OE-номера, общие минимум для N аналогов — это
+    #    вероятный настоящий OE машины. Никто не достиг порога -> топ-3 частых.
+    anchor_keys = {k for k, c in freq.items() if c >= min_oem_support}
+    if not anchor_keys and freq:
+        anchor_keys = {k for k, _ in sorted(freq.items(),
+                       key=lambda kv: (-kv[1], kv[0]))[:3]}
+    anchor_oems = [label[k] for k in sorted(anchor_keys)]
+
+    # 3) ТОЧНО подходящие: аналоги, чьи OEM пересекаются с якорем
+    def _matches_anchor(r):
+        return any(_norm(o) in anchor_keys for o in (r.get("oem_numbers") or []))
+    exact_rows = rank_article_rows(
+        [r for r in enriched if r.get("oem_numbers") and _matches_anchor(r)])
+
+    def _clean(r, is_exact):
+        return {"brand": r.get("brand"), "article": r.get("article"),
+                "product_name": r.get("product_name", ""),
+                "criteria": r.get("criteria", {}), "exact": is_exact}
+    exact = [_clean(r, True) for r in exact_rows[:top_n]]
+
+    # 4) top = точные сначала, добор премиальными (бот читает top —
+    #    улучшается автоматически, без правок cmd_vin)
+    seen = {(c["brand"], c["article"]) for c in exact}
+    def _score(r):
+        return (1 if _is_premium(r.get("brand")) else 0,
+                1 if r.get("oem_numbers") else 0)
+    top_clean = list(exact)
+    for r in sorted(enriched, key=_score, reverse=True):
+        if len(top_clean) >= top_n:
+            break
+        key = (r.get("brand"), r.get("article"))
+        if key in seen:
+            continue
+        seen.add(key)
+        top_clean.append(_clean(r, False))
+
+    # 3) группировка по "размеру" (ключевые критерии) — для отсева не того варианта
+    _size_keys = ("высот", "диаметр", "резьб", "height", "diameter", "thread")
+    groups: dict[str, list] = {}
+    for r in enriched:
+        # т��лько обогащённые строки, у которых реально есть размерные критерии
+        crit = r.get("criteria") or {}
+        if not crit:
+            continue
+        sig_parts = [f"{name}={val}" for name, val in crit.items()
+                     if any(sk in name.lower() for sk in _size_keys)]
+        if not sig_parts:
+            continue  # нет размеров — не можем отнести к конкретному варианту
+        sig = "; ".join(sorted(sig_parts))
+        groups.setdefault(sig, []).append(r.get("article"))
+
+    return {"oem_numbers": oem_sorted, "anchor_oems": anchor_oems,
+            "exact": exact, "top": top_clean, "groups": groups}
+
+
+async def resolve_oem_detailed(session, vin: str, cat_id: str,
+                               part_name: str = "", keywords: Optional[list] = None,
+                               *, top_n: int = 5, max_calls: int = 8) -> dict:
+    """Полный путь + OEM-детали. Возвращает meta (как resolve_oem) плюс:
+        "rows": [{brand,article,sup_id,art_id,...}],   # все артикулы (с sup_id)
+        "enriched": [...],                              # топ обогащён getArticle
+        "summary": {oem_numbers, top, groups}.
+    parts (старый формат (brand,article)) тоже заполняется — для совместимости.
+    """
+    meta = {"parts": [], "rows": [], "enriched": [], "summary": {},
+            "car_id": None, "str_id": None, "source": "tecdoc",
+            "reason": None, "car_str": None, "brand": None,
+            "engine_code": None}
+
+    car = await resolve_car_id(session, vin)
+    meta["car_id"] = car["car_id"]
+    meta["car_str"] = car.get("car_str")
+    meta["brand"] = car.get("brand")
+    meta["engine_code"] = car.get("engine_code")
+    if not car["car_id"]:
+        meta["reason"] = "no_car_id"
+        return meta
+
+    str_id = await resolve_str_id(session, car["car_id"], cat_id, part_name, keywords)
+    meta["str_id"] = str_id
+    if not str_id:
+        meta["reason"] = "no_str_id"
+        return meta
+
+    ar = await get_articles(session, car["car_id"], str_id)
+    if not ar.get("_ok"):
+        meta["reason"] = "no_articles"
+        return meta
+    rows = get_article_rows_from_payload(ar["data"])
+    meta["rows"] = rows
+    meta["parts"] = [(r["brand"], r["article"]) for r in rows]
+    if not rows:
+        meta["reason"] = "no_articles"
+        return meta
+
+    enriched = await enrich_articles_with_oem(session, rows, max_calls=max_calls)
+    meta["enriched"] = enriched
+    meta["summary"] = build_oem_summary(enriched, top_n=top_n)
+    return meta
+
+
+async def debug_article_by_vin(session, vin: str, str_id: int,
+                               *, top_n: int = 5) -> str:
+    """Диагностика getArticle: VIN + strId -> OEM-номер(а) + топ аналогов.
+    Сам резолвит carId, тянет артикулы и обогащает топ через getArticle."""
+    info = await resolve_car_id(session, vin)
+    car_id = info.get("car_id")
+    if not car_id:
+        return (f"carId не получен (source={info.get('source')}). "
+                f"Проверь VIN/ключ VINdecode.")
+    ar = await get_articles(session, car_id, str_id)
+    if not ar.get("_ok"):
+        return (f"getArticles error: {ar.get('_error')} | detail={ar.get('_detail')}")
+    rows = get_article_rows_from_payload(ar["data"])
+    if not rows:
+        raw = json.dumps(ar.get("data"), ensure_ascii=False)[:300]
+        return (f"Артикулы пустые/формат не распознан. carId={car_id}, "
+                f"strId={str_id}\nОтвет: {raw}")
+    enriched = await enrich_articles_with_oem(session, rows, max_calls=top_n + 3)
+    summary = build_oem_summary(enriched, top_n=top_n)
+
+    lines = [f"OK carId={car_id} ({info.get('source')}), strId={str_id}, "
+             f"всего артикулов={len(rows)}"]
+    if info.get("engine_code"):
+        lines.append(f"Код двигателя: {info.get('engine_code')}")
+    oem = summary.get("oem_numbers") or []
+    anchor = summary.get("anchor_oems") or []
+    lines.append("")
+    lines.append("ОРИГИНАЛ (OEM): " + (", ".join(oem[:10]) if oem else "— не отдал getArticle (проверь ключ PARTSAPI_KEY_GETARTICLE)"))
+    if anchor:
+        lines.append("ЯКОРЬ (вероятный OE этой машины): " + ", ".join(anchor[:5]))
+    lines.append("")
+    _exact = summary.get("exact", [])
+    lines.append("Точно подходящие (по якорю OE):" if _exact else "Топ подходящих (якорь не найден):")
+    for t in (_exact or summary.get("top", [])):
+        crit = t.get("criteria") or {}
+        crit_s = "; ".join(f"{k}={v}" for k, v in list(crit.items())[:3])
+        lines.append(f"  • {t.get('brand')} {t.get('article')}"
+                     + (f" — {t.get('product_name')}" if t.get('product_name') else "")
+                     + (f" [{crit_s}]" if crit_s else ""))
+    if len(summary.get("groups", {})) > 1:
+        lines.append("")
+        lines.append("Разные размеры/исполнения (для отсева):")
+        for sig, arts in summary["groups"].items():
+            lines.append(f"  – {sig}: {len(arts)} шт (напр. {', '.join(str(a) for a in arts[:3])})")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
