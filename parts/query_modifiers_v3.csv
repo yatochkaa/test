@@ -1,0 +1,17 @@
+﻿modifier;modifier_type;normalized_modifier
+передний;position;передний
+задний;position;задний
+левый;position;левый
+правый;position;правый
+верхний;position;верхний
+нижний;position;нижний
+внутренний;position;внутренний
+наружный;position;наружный
+комплект;attribute;комплект
+ремкомплект;attribute;ремкомплект
+в сборе;attribute;в сборе
+оригинал;attribute;оригинал
+аналог;attribute;аналог
+контрактный;attribute;контрактный
+новый;attribute;новый
+бу;attribute;бу
