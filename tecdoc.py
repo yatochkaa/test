@@ -20,6 +20,7 @@ TecDoc-слой подбора OEM для test_vin_bot.
 """
 from __future__ import annotations
 
+import urllib.request, urllib.parse, urllib.error
 import os
 import re
 import json
@@ -177,6 +178,22 @@ def set_cache_hooks(get_fn: Callable[[str], Any], set_fn: Callable[[str, Any], N
 # ---------------------------------------------------------------------------
 # Низкоуровневый GET с ретраями, rate-limit и классификацией ошибок partsapi
 # ---------------------------------------------------------------------------
+def _http_get_urllib(q):
+    """GET через urllib (как в test.py) — partsapi пускает его, в отличие от aiohttp."""
+    url = BASE_URL + "?" + urllib.parse.urlencode(q)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return e.code, body          # вернём 401/4xx + тело, _request разберёт сам
+    except Exception:
+        return 599, ""               # сеть/таймаут -> уйдёт в ретрай как 5xx
+
 async def _request(session, method: str, params: Optional[dict] = None,
                    *, use_cache: bool = True, max_retries: int = _MAX_RETRIES) -> dict:
     """Вернёт {"_ok": True, "data": ...} либо {"_error": CODE, ...}."""
@@ -201,42 +218,83 @@ async def _request(session, method: str, params: Optional[dict] = None,
         try:
             if API_DELAY:
                 await asyncio.sleep(API_DELAY)
-            timeout = aiohttp.ClientTimeout(total=_TIMEOUT)
-            async with session.get(BASE_URL, params=q, timeout=timeout) as resp:
-                status = resp.status
-                text = await resp.text()
+            status, text = await asyncio.to_thread(_http_get_urllib, q)
 
-                if status == 404:
-                    return {"_error": "NOT_FOUND", "_status": 404, "_method": method}
-                if status in (401, 403):
-                    # различим rate-limit (5000) и реальную авторизацию
-                    code = _error_code_from_text(text)
-                    if code == 5000:
-                        return {"_error": "RATE_LIMIT", "_status": status, "_method": method}
-                    return {"_error": "AUTH", "_status": status, "_method": method}
-                if status >= 500:
-                    last_err = f"HTTP {status}"
-                    continue  # 5xx -> ретрай
+            if status == 404:
+                return {"_error": "NOT_FOUND", "_status": 404, "_method": method}
+            if status in (401, 403):
+                # различим rate-limit (5000) и реальную авторизацию
+                code = _error_code_from_text(text)
+                if code == 5000:
+                    return {"_error": "RATE_LIMIT", "_status": status, "_method": method}
+                return {"_error": "AUTH", "_status": status, "_method": method}
+            if status >= 500:
+                last_err = f"HTTP {status}"
+                continue  # 5xx -> ретрай
 
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    return {"_error": "JSON_ERROR", "_raw": text[:300], "_method": method}
+            try:
+                data = json.loads(text)
+            except Exception:
+                return {"_error": "JSON_ERROR", "_raw": text[:300], "_method": method}
 
-                # partsapi иногда отдаёт ошибку телом при 200
-                if isinstance(data, dict) and data.get("error_code"):
-                    ec = data.get("error_code")
-                    if ec == 5000:
-                        return {"_error": "RATE_LIMIT", "_method": method}
-                    if ec == 5007:
-                        last_err = "SERVER_ERROR(5007)"
-                        continue
-                    return {"_error": "API_ERROR", "_code": ec,
-                            "_msg": data.get("message"), "_method": method}
+            # partsapi иногда отдаёт ошибку телом при 200
+            if isinstance(data, dict) and data.get("error_code"):
+                ec = data.get("error_code")
+                if ec == 5000:
+                    return {"_error": "RATE_LIMIT", "_method": method}
+                if ec == 5007:
+                    last_err = "SERVER_ERROR(5007)"
+                    continue
+                return {"_error": "API_ERROR", "_code": ec,
+                        "_msg": data.get("message"), "_method": method}
 
-                if use_cache:
-                    _cache_set(cache_key, data)
-                return {"_ok": True, "data": data, "_status": status, "_method": method}
+            if use_cache:
+                _cache_set(cache_key, data)
+            return {"_ok": True, "data": data, "_status": status, "_method": method}
+
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+
+    return {"_error": "TIMEOUT_OR_5XX", "_detail": last_err, "_method": method}
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            if API_DELAY:
+                await asyncio.sleep(API_DELAY)
+            status, text = await asyncio.to_thread(_http_get_urllib, q)
+
+            if status == 404:
+                return {"_error": "NOT_FOUND", "_status": 404, "_method": method}
+            if status in (401, 403):
+                # различим rate-limit (5000) и реальную авторизацию
+                code = _error_code_from_text(text)
+                if code == 5000:
+                    return {"_error": "RATE_LIMIT", "_status": status, "_method": method}
+                return {"_error": "AUTH", "_status": status, "_method": method}
+            if status >= 500:
+                last_err = f"HTTP {status}"
+                continue  # 5xx -> ретрай
+
+            try:
+                data = json.loads(text)
+            except Exception:
+                return {"_error": "JSON_ERROR", "_raw": text[:300], "_method": method}
+
+            # partsapi иногда отдаёт ошибку телом при 200
+            if isinstance(data, dict) and data.get("error_code"):
+                ec = data.get("error_code")
+                if ec == 5000:
+                    return {"_error": "RATE_LIMIT", "_method": method}
+                if ec == 5007:
+                    last_err = "SERVER_ERROR(5007)"
+                    continue
+                return {"_error": "API_ERROR", "_code": ec,
+                        "_msg": data.get("message"), "_method": method}
+
+            if use_cache:
+                _cache_set(cache_key, data)
+            return {"_ok": True, "data": data, "_status": status, "_method": method}
 
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             last_err = f"{type(e).__name__}: {e}"
@@ -657,14 +715,35 @@ async def resolve_car_id(session, vin: str) -> dict:
                     if mismatch:
                         rc = await get_cars(session, manu_id, mod_id)
                         if rc.get("_ok"):
+                            cars_list = _as_list(rc["data"])
                             new_id = _pick_car_by_spec(
-                                _as_list(rc["data"]),
+                                cars_list,
                                 kw=spec.get("kw"), hp=spec.get("hp"),
                                 cc=spec.get("cc"), fwd=fwd
                             )
                             if new_id:
                                 car_id = new_id
                                 source = "VINdecode+VINdecodeOE/getCars"
+                                # пере-собрать подпись и код двигателя из ВЫБРАННОЙ
+                                # модификации getCars — иначе car_str остаётся от
+                                # неверного кандидата VINdecode (напр. "1.8 T")
+                                for c in cars_list:
+                                    if _to_int(_pick(c, "carId", "carID", "car_id")) == new_id:
+                                        nm = _car_str_from_row(c)
+                                        # собрать "BRAND MODEL ENGINE" без дублей токенов
+                                        _seen, _words = set(), []
+                                        for _p in (brand, modely, nm):
+                                            for _w in str(_p or "").split():
+                                                _wn = _norm(_w)
+                                                if _wn and _wn not in _seen:
+                                                    _seen.add(_wn)
+                                                    _words.append(_w)
+                                        if _words:
+                                            car_str = " ".join(_words)
+                                        ec = _engine_code(c)
+                                        if ec:
+                                            out["engine_code"] = ec
+                                        break   
 
             if car_id:
                 out.update({
@@ -739,37 +818,104 @@ def _flatten_tree(node: Any, acc: list) -> None:
 
 def _tokens(s: str) -> set:
     return {t for t in re.split(r"[^a-zа-я0-9]+", str(s).lower()) if len(t) > 2}
+    
+# === Russian part-name matcher (для resolve_str_id) ===
+_MATCH_STOP = {'для','на','и','в','с','по','от','к','до','за','при','из','об','у','или','же',
+               'механизм','систем','комплектующ','составляющ','част','навесн'}
+_MATCH_AXIS = {'передн','задн','лев','прав','верхн','нижн'}   # оси в дереве нет — фильтруем критериями артикула
+_MATCH_SKIP_BRANCH = ('Гибридн', 'электропривод', 'нструмент')  # электро/гибрид/спец-инструмент
+_MATCH_ALIAS = {
+    'шаровая опора': 'шарнир поворотного рычага',
+    'наконечник рулевой': 'рулевая тяга',
+    'сцепление': 'комплект сцепления',
+}
+_MATCH_HARD = {'генератор': 100350}
+_MATCH_SUF = ['ого','его','ому','ему','ыми','ими','ами','ями','ах','ях','ам','ям','ов','ев',
+              'ий','ый','ой','ая','яя','ое','ее','ые','ие','ых','их','ым','им','юю','ую',
+              'а','я','ы','и','о','е','у','ю','ь','й']
+
+def _match_stem(w: str) -> str:
+    w = w.lower().replace('ё', 'е')
+    for s in _MATCH_SUF:
+        if len(w) - len(s) >= 4 and w.endswith(s):
+            w = w[:-len(s)]; break
+    if w.endswith('нн'):          # салонн -> салон
+        w = w[:-1]
+    return w
+
+def _match_toks(text, keep_axis: bool = True) -> set:
+    out = set()
+    for w in re.findall(r'[а-яa-z0-9]+', str(text).lower().replace('ё', 'е')):
+        st = _match_stem(w)
+        if st in _MATCH_STOP or w in _MATCH_STOP:
+            continue
+        if not keep_axis and st in _MATCH_AXIS:
+            continue
+        out.add(st)
+    return out
+
+def _flatten_tree_paths(node, acc: list) -> None:
+    """Как _flatten_tree, но сохраняет полный STR_PATH и уровень (нужно для веток/диск-барабан)."""
+    if isinstance(node, list):
+        for n in node:
+            _flatten_tree_paths(n, acc)
+        return
+    if isinstance(node, dict):
+        sid = _to_int(_pick(node, "STR_ID", "strId", "id", "nodeId", "assemblyGroupNodeId"))
+        path = _pick(node, "STR_PATH", "path") or _pick(node, "STR_NODE_NAME", "name", "text", "title")
+        lvl = _to_int(_pick(node, "STR_LEVEL", "level")) or 0
+        if sid is not None and path:
+            acc.append((sid, str(path), lvl))
+        for v in node.values():
+            if isinstance(v, (list, dict)):
+                _flatten_tree_paths(v, acc)
 
 
 async def resolve_str_id(session, car_id: int, cat_id: str,
-                         part_name: str = "", keywords: Optional[list] = None) -> Optional[int]:
-    """cat_id (+ part_name) -> strId дерева для данного авто.
-
-    1) Явный CAT_TO_STR_ID имеет приоритет.
-    2) Иначе — ма��ч названия узла по part_name/keywords (пересечение токенов).
+        part_name: str = "", keywords: Optional[list] = None) -> Optional[int]:
+    """cat_id (+ part_name/keywords) -> strId дерева для данного авто.
+    1) явный CAT_TO_STR_ID  2) HARD/ALIAS словарь  3) стемминг-матч по РУССКОМУ STR_PATH.
+    keywords: рекомендую передавать [group_name, subgroup_name] от PartsResolver.
     """
     if cat_id in CAT_TO_STR_ID:
         return CAT_TO_STR_ID[cat_id]
+
+    q = (part_name or "").lower().strip()
+    if q in _MATCH_HARD:
+        return _MATCH_HARD[q]
 
     r = await get_search_tree(session, car_id)
     if not r.get("_ok"):
         return None
     nodes: list = []
-    _flatten_tree(r["data"], nodes)
+    _flatten_tree_paths(r["data"], nodes)
     if not nodes:
         return None
 
-    want = _tokens(part_name)
-    for kw in (keywords or []):
-        want |= _tokens(kw)
+    query = _MATCH_ALIAS.get(q, part_name) + " " + " ".join(keywords or [])
+    want = _match_toks(query, keep_axis=False)
     if not want:
         return None
+    allow_el = ('электр' in want) or ('гибрид' in want)
 
-    best_id, best_score = None, 0
-    for sid, name in nodes:
-        score = len(want & _tokens(name))
-        if score > best_score:
-            best_id, best_score = sid, score
+    best_key, best_id = None, None
+    for sid, path, lvl in nodes:
+        if any(b in path for b in _MATCH_SKIP_BRANCH) and not allow_el:
+            continue
+        leaf = _match_toks(path.split(">")[-1].strip())
+        hits = len(want & leaf)
+        if not hits:
+            continue
+        ratio = hits / len(leaf) if leaf else 0
+        key = (hits,                                  # сколько слов запроса попало в лист
+               1 if want <= leaf else 0,              # полное покрытие
+               round(ratio, 3),                       # чистота листа (Амортизатор > Стойка амортизатора)
+               len(want & _match_toks(path)),         # совпадения по всему пути
+               1 if 'Дисков' in path else 0,          # диск > барабан
+               -1 if 'Барабан' in path else 0,
+               lvl)                                    # глубже = конкретнее
+        if best_key is None or key > best_key:
+            best_key, best_id = key, sid
     return best_id
 
 
