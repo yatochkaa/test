@@ -1,4 +1,5 @@
 import tecdoc
+from stage3_format import format_vin_reply, extract_brand_from_query
 import asyncio
 import logging
 import os
@@ -2704,11 +2705,11 @@ async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cat_pfx    = f"{cat_label} " if cat_label else ""
             group_name = dedupe_name(f"{pos_pfx}{cat_pfx}{part_name}".strip())
 
-            header = [f"⏳ Ищу: <b>{group_name}</b>"]
-            if car_str:
-                header.append(f"🚗 {car_str}")
-            header.append(f"VIN: <code>{vin}</code> | cat: <code>{cat_id}</code>")
-            await update.message.reply_text("\n".join(header), parse_mode="HTML")
+            status = await update.message.reply_text(
+            f"🔎 Ищу по запросу: <b>{group_name}</b>\n"
+            f"⏳ Подбираю оригинал и аналоги…",
+            parse_mode="HTML",
+)
 
             # ── Шаг 1.5: TecDoc (carId → strId → OEM) — приоритетный источник ──
             tec = await tecdoc.resolve_oem_detailed(session, vin, cat_id, part_name)
@@ -2723,35 +2724,14 @@ async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"reason={tec.get('reason')}"
             )
 
-            # ── НОВОЕ: оригинальный OEM + точный топ, и сразу выходим ──
+            # ── НОВОЕ: красивый ответ через stage3_format ──
             summary = tec.get("summary") or {}
             if tec.get("car_id") and summary.get("top"):
-                oem = summary.get("oem_numbers") or []
-                lines = [f"✅ Найдено: **{group_name}**"]
-                if car_str:
-                    lines.append(f"🚗 {car_str}")
-                lines.append(f"VIN: {vin} | cat: {cat_id}")
-                lines.append("─" * 28)
-                lines.append("🔧 **Оригинал (OEM):** "
-                             + (", ".join(oem[:5]) if oem else "не определён"))
-                lines.append("")
-                lines.append("✅ **Точно подходящие:**")
-                for t in summary["top"]:
-                    crit = t.get("criteria") or {}
-                    crit_s = "; ".join(f"{k}={v}" for k, v in list(crit.items())[:2])
-                    line = f" • {t.get('brand')} {t.get('article')}"
-                    if t.get("product_name"):
-                        line += f" — {t['product_name']}"
-                    if crit_s:
-                        line += f" ({crit_s})"
-                    lines.append(line)
-                groups = summary.get("groups") or {}
-                if len(groups) > 1:
-                    lines.append("")
-                    lines.append("⚠️ Есть разные размеры — выбери по двигателю:")
-                    for sig, arts in list(groups.items())[:4]:
-                        lines.append(f"  – {sig}: {len(arts)} шт")
-                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+                text = format_vin_reply(tec, part_label=group_name)
+                try:
+                    await status.edit_text(text, parse_mode="HTML")
+                except Exception:
+                    await update.message.reply_text(text, parse_mode="HTML")
                 continue
 
             if tec_parts:
@@ -2836,7 +2816,7 @@ async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if crosses:
                     cross_block = "\n".join(
-                        f" • **{b}** — <code>{a}</code>" for b, a in crosses
+                        f" • <b>{b}</b> — <code>{a}</code>" for b, a in crosses
                     )
                     crosses_header = (
                         f"🔄 Аналоги (топ-{len(crosses)} из {len(crosses_all)}) — {p_brand} {p_art}:"
@@ -2852,7 +2832,7 @@ async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cat_note = f"\nℹ️ Данные найдены через альтернативный cat: <code>{actual_cat}</code>"
 
                 msg = "\n".join([
-                    f"✅ Найдено: **{group_name}**",
+                    f"✅ Найдено: <b>{group_name}</b>",
                     *([f"🚗 {car_str}"] if car_str else []),
                     f"VIN: <code>{vin}</code>",
                     f"Категория: <code>{cat_id}</code>{cat_note}",
@@ -2868,7 +2848,7 @@ async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if api_state_ok and all_parts:
                 foreign_lines = []
                 for b, a in all_parts:
-                    foreign_lines.append(f" • **{b}** — <code>{a}</code>")
+                    foreign_lines.append(f" • <b>{b}</b> — <code>{a}</code>")
                     if len(foreign_lines) >= 8:
                         break
 
@@ -2877,7 +2857,7 @@ async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cat_note = f"\nℹ️ Данные найдены через альтернативный cat: <code>{actual_cat}</code>"
 
                 msg = "\n".join([
-                    f"⚠️ Найдены данные по **{group_name}**, но основной OEM не удалось выделить.",
+                    f"⚠️ Найдены данные по <b>{group_name}</b>, но основной OEM не удалось выделить.",
                     *([f"🚗 {car_str}"] if car_str else []),
                     f"VIN: <code>{vin}</code>",
                     f"Категория: <code>{cat_id}</code>{cat_note}",
@@ -2896,7 +2876,7 @@ async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if cat_id in NO_FALLBACK_CATS:
                     hint = NO_FALLBACK_HINTS.get(cat_id, "")
                     await update.message.reply_text(
-                        f"ℹ️ По категории **{group_name}** в источнике данных ничего не найдено.\n\n{hint}",
+                        f"ℹ️ По категории <b>{group_name}</b> в источнике данных ничего не найдено.\n\n{hint}",
                         parse_mode="HTML",
                     )
                     continue
@@ -2913,7 +2893,7 @@ async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not fallback:
                     hint = NO_FALLBACK_HINTS.get(cat_id, "")
                     await update.message.reply_text(
-                        f"ℹ️ По категории **{group_name}** в источнике данных ничего не найдено.{chr(10) * 2}{hint}",
+                        f"ℹ️ По категории <b>{group_name}</b> в источнике данных ничего не найдено.{chr(10) * 2}{hint}",
                         parse_mode="HTML",
                     )
                     continue
@@ -2956,7 +2936,7 @@ async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                 lines = [
-                    f"⚠️ По категории **{group_name}** не удалось надёжно получить данные от поставщика.",
+                    f"⚠️ По категории <b>{group_name}</b> не удалось надёжно получить данные от поставщика.",
                     *([f"🚗 {car_str}"] if car_str else []),
                     f"VIN: <code>{vin}</code>",
                     f"Категория: <code>{cat_id}</code>",
