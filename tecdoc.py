@@ -30,6 +30,11 @@ from typing import Any, Optional, Callable
 
 import aiohttp
 
+try:
+    from parts_resolver_map import resolve as _pr_resolve
+except Exception:
+    _pr_resolve = None
+
 log = logging.getLogger("tecdoc")
 
 BASE_URL = "https://api.partsapi.ru"
@@ -871,12 +876,34 @@ def _flatten_tree_paths(node, acc: list) -> None:
                 _flatten_tree_paths(v, acc)
 
 
+# =============================================================================
+# ИНСТРУКЦИЯ (читай 2 шага):
+#
+# ШАГ 1. В САМОМ ВЕРХУ файла tecdoc.py (рядом с другими import)
+#         добавь эти 4 строки:
+#
+#             try:
+#                 from parts_resolver_map import resolve as _pr_resolve
+#             except Exception:
+#                 _pr_resolve = None
+#
+# ШАГ 2. Найди в tecdoc.py свою старую функцию:
+#             async def resolve_str_id(...):
+#                 ... до строки ...
+#                 return best_id
+#         ВЫДЕЛИ ЕЁ ЦЕЛИКОМ (от "async def resolve_str_id"
+#         до "return best_id" включительно), УДАЛИ и вставь
+#         вместо неё всё, что ниже этой рамки.
+# =============================================================================
+
+
 async def resolve_str_id(session, car_id: int, cat_id: str,
-        part_name: str = "", keywords: Optional[list] = None) -> Optional[int]:
+                         part_name: str = "", keywords: Optional[list] = None) -> Optional[int]:
     """cat_id (+ part_name/keywords) -> strId дерева для данного авто.
-    1) явный CAT_TO_STR_ID  2) HARD/ALIAS словарь  3) стемминг-матч по РУССКОМУ STR_PATH.
-    keywords: рекомендую передавать [group_name, subgroup_name] от PartsResolver.
+    1) явный CAT_TO_STR_ID  2) внешний резолвер (hardcoded/синонимы)
+    3) стемминг-матч по РУССКОМУ STR_PATH  4) резолвер-фолбэк.
     """
+    # 1) уже известный cat_id
     if cat_id in CAT_TO_STR_ID:
         return CAT_TO_STR_ID[cat_id]
 
@@ -884,6 +911,13 @@ async def resolve_str_id(session, car_id: int, cat_id: str,
     if q in _MATCH_HARD:
         return _MATCH_HARD[q]
 
+    # 2) >>> НОВОЕ: точный hardcoded/синоним без запроса к API <<<
+    if _pr_resolve:
+        _hits = _pr_resolve(part_name or "")
+        if _hits and _hits[0]["method"].startswith(("hardcoded", "exact")):
+            return int(_hits[0]["str_id"])
+
+    # 3) матч по дереву конкретной машины (твоя старая логика)
     r = await get_search_tree(session, car_id)
     if not r.get("_ok"):
         return None
@@ -907,15 +941,22 @@ async def resolve_str_id(session, car_id: int, cat_id: str,
         if not hits:
             continue
         ratio = hits / len(leaf) if leaf else 0
-        key = (hits,                                  # сколько слов запроса попало в лист
-               1 if want <= leaf else 0,              # полное покрытие
-               round(ratio, 3),                       # чистота листа (Амортизатор > Стойка амортизатора)
-               len(want & _match_toks(path)),         # совпадения по всему пути
-               1 if 'Дисков' in path else 0,          # диск > барабан
+        key = (hits,
+               1 if want <= leaf else 0,
+               round(ratio, 3),
+               len(want & _match_toks(path)),
+               1 if 'Дисков' in path else 0,
                -1 if 'Барабан' in path else 0,
-               lvl)                                    # глубже = конкретнее
+               lvl)
         if best_key is None or key > best_key:
             best_key, best_id = key, sid
+
+    # 4) >>> НОВОЕ: страховка, если по дереву ничего не нашли <<<
+    if best_id is None and _pr_resolve:
+        _hits = _pr_resolve(part_name or "")
+        if _hits:
+            return int(_hits[0]["str_id"])
+
     return best_id
 
 
@@ -1182,8 +1223,10 @@ async def get_article_details(session, art_num: str, sup_id: Any) -> Optional[di
         return None
     return parse_article(r["data"])
 
+TECDOC_MAX_ENRICH = int(os.getenv("TECDOC_MAX_ENRICH", "8"))
+_ENRICH_FAIL_STOP = int(os.getenv("TECDOC_ENRICH_FAIL_STOP", "3"))
 
-async def enrich_articles_with_oem(session, rows: list, *, max_calls: int = 8,
+async def enrich_articles_with_oem(session, rows, *, max_calls: int = 8,
                                    premium_first: bool = True) -> list:
     """Для топ-N строк (из get_article_rows_from_payload) тянет getArticle и
     добавляет ключи oem_numbers/product_name/criteria/superseded_by. Остальные
