@@ -25,10 +25,13 @@ import os
 import re
 import json
 import asyncio
+import time
+import random
 import logging
 from typing import Any, Optional, Callable
-
 import aiohttp
+
+
 
 try:
     from parts_resolver_map import resolve as _pr_resolve
@@ -78,6 +81,36 @@ _DEFAULT_CAR_TYPE_ID = os.getenv("PARTSAPI_CAR_TYPE_ID", "PC")
 _CAR_TYPE_ID_CANDIDATES = os.getenv("PARTSAPI_CAR_TYPE_ID_CANDIDATES", "PC,1,2,3")
 # Подтверждённый рабочий числовой carType (заполняется при первом успехе).
 _WORKING_CAR_TYPE_ID: Optional[str] = None
+
+_RL_COOLDOWN_UNTIL = 0.0  # monotonic-метка: пока now < этого — API не дёргаем
+_RL_BASE_COOLDOWN = float(os.getenv("TECDOC_RL_COOLDOWN", "90"))  # сек паузы после лимита
+​
+​
+def _rl_left() -> float:
+    """Сколько секунд ещё действует пауза (0 — паузы нет)."""
+    return max(0.0, _RL_COOLDOWN_UNTIL - time.monotonic())
+​
+​
+def _rl_trip(seconds: float = None):
+    """Взвести предохранитель: поставить глобальную паузу."""
+    global _RL_COOLDOWN_UNTIL
+    s = _RL_BASE_COOLDOWN if seconds is None else seconds
+    _RL_COOLDOWN_UNTIL = max(_RL_COOLDOWN_UNTIL, time.monotonic() + s)
+    
+def _looks_like_ban(status: int, text: str) -> bool:
+    """429 или HTML-страница бана/лимита (не JSON от partsapi)."""
+    if status == 429:
+        return True
+    t = (text or "").lower()
+    markers = (
+        "too many requests", "rate limit", "access denied", "forbidden",
+        "cloudflare", "ddos", "бан", "заблокирован", "превышен лимит",
+        "слишком много запросов",
+    )
+    # типичная бан-страница приходит HTML-ом, а не JSON
+    is_html = "<html" in t or "<!doctype" in t
+    return any(m in t for m in markers) or (is_html and status in (403, 503))
+
 
 API_DELAY = float(os.getenv("API_DELAY", "0.5"))
 _MAX_RETRIES = 2
@@ -201,110 +234,87 @@ def _http_get_urllib(q):
 
 async def _request(session, method: str, params: Optional[dict] = None,
                    *, use_cache: bool = True, max_retries: int = _MAX_RETRIES) -> dict:
-    """Вернёт {"_ok": True, "data": ...} либо {"_error": CODE, ...}."""
+    """Вернёт {"_ok": True, "data": ...} либо {"_error": CODE, ...}.
+    Бан-безопасная версия: backoff + предохранитель на rate-limit."""
     key = get_key(method)
     if not key:
         return {"_error": "NO_KEY", "_method": method}
-
+​
     q = {"method": method, "key": key, "lang": _LANG_BY_METHOD.get(method, LANG_CODE)}
     if params:
-        # aiohttp не принимает None в params -> кладём только заполненные значения
         q.update({k: str(v) for k, v in params.items() if v is not None})
-
+​
     cache_key = "tecdoc:" + method + ":" + ",".join(
         f"{k}={v}" for k, v in sorted(q.items()) if k != "key")
     if use_cache:
         cached = _cache_get(cache_key)
         if cached is not None:
             return {"_ok": True, "data": cached, "_cached": True, "_method": method}
-
+​
+    # ПРЕДОХРАНИТЕЛЬ: если недавно получили лимит/бан — не дёргаем API вообще
+    left = _rl_left()
+    if left > 0:
+        return {"_error": "RATE_LIMIT", "_cooldown": round(left),
+                "_reason": "cooldown", "_method": method}
+​
     last_err = None
     for attempt in range(max_retries + 1):
         try:
+            # backoff: 1я попытка = API_DELAY, дальше ×2 + jitter
             if API_DELAY:
-                await asyncio.sleep(API_DELAY)
+                delay = API_DELAY * (2 ** attempt) + random.uniform(0.0, 0.3)
+                await asyncio.sleep(delay)
+​
             status, text = await asyncio.to_thread(_http_get_urllib, q)
-
+​
+            # бан/429/HTML-заглушка → взводим предохранитель, НЕ ретраим
+            if _looks_like_ban(status, text):
+                _rl_trip()
+                return {"_error": "RATE_LIMIT", "_status": status,
+                        "_cooldown": round(_rl_left()), "_reason": "ban_page",
+                        "_method": method}
+​
             if status == 404:
                 return {"_error": "NOT_FOUND", "_status": 404, "_method": method}
+​
             if status in (401, 403):
-                # различим rate-limit (5000) и реальную авторизацию
                 code = _error_code_from_text(text)
                 if code == 5000:
-                    return {"_error": "RATE_LIMIT", "_status": status, "_method": method}
+                    _rl_trip()
+                    return {"_error": "RATE_LIMIT", "_status": status,
+                            "_cooldown": round(_rl_left()), "_method": method}
                 return {"_error": "AUTH", "_status": status, "_method": method}
+​
             if status >= 500:
                 last_err = f"HTTP {status}"
-                continue  # 5xx -> ретрай
-
+                continue  # 5xx -> ретрай с backoff
+​
             try:
                 data = json.loads(text)
             except Exception:
                 return {"_error": "JSON_ERROR", "_raw": text[:300], "_method": method}
-
+​
             # partsapi иногда отдаёт ошибку телом при 200
             if isinstance(data, dict) and data.get("error_code"):
                 ec = data.get("error_code")
                 if ec == 5000:
-                    return {"_error": "RATE_LIMIT", "_method": method}
+                    _rl_trip()
+                    return {"_error": "RATE_LIMIT", "_cooldown": round(_rl_left()),
+                            "_method": method}
                 if ec == 5007:
                     last_err = "SERVER_ERROR(5007)"
                     continue
                 return {"_error": "API_ERROR", "_code": ec,
                         "_msg": data.get("message"), "_method": method}
-
+​
             if use_cache:
                 _cache_set(cache_key, data)
             return {"_ok": True, "data": data, "_status": status, "_method": method}
-
+​
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             last_err = f"{type(e).__name__}: {e}"
             continue
-
-    return {"_error": "TIMEOUT_OR_5XX", "_detail": last_err, "_method": method}
-    last_err = None
-    for attempt in range(max_retries + 1):
-        try:
-            if API_DELAY:
-                await asyncio.sleep(API_DELAY)
-            status, text = await asyncio.to_thread(_http_get_urllib, q)
-
-            if status == 404:
-                return {"_error": "NOT_FOUND", "_status": 404, "_method": method}
-            if status in (401, 403):
-                # различим rate-limit (5000) и реальную авторизацию
-                code = _error_code_from_text(text)
-                if code == 5000:
-                    return {"_error": "RATE_LIMIT", "_status": status, "_method": method}
-                return {"_error": "AUTH", "_status": status, "_method": method}
-            if status >= 500:
-                last_err = f"HTTP {status}"
-                continue  # 5xx -> ретрай
-
-            try:
-                data = json.loads(text)
-            except Exception:
-                return {"_error": "JSON_ERROR", "_raw": text[:300], "_method": method}
-
-            # partsapi иногда отдаёт ошибку телом при 200
-            if isinstance(data, dict) and data.get("error_code"):
-                ec = data.get("error_code")
-                if ec == 5000:
-                    return {"_error": "RATE_LIMIT", "_method": method}
-                if ec == 5007:
-                    last_err = "SERVER_ERROR(5007)"
-                    continue
-                return {"_error": "API_ERROR", "_code": ec,
-                        "_msg": data.get("message"), "_method": method}
-
-            if use_cache:
-                _cache_set(cache_key, data)
-            return {"_ok": True, "data": data, "_status": status, "_method": method}
-
-        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-            last_err = f"{type(e).__name__}: {e}"
-            continue
-
+​
     return {"_error": "TIMEOUT_OR_5XX", "_detail": last_err, "_method": method}
 
 
