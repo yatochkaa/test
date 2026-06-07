@@ -79,6 +79,47 @@ def _split_oem(s):
         return mk.strip().upper(), num.strip()
     return "", s
 
+_OEM_BASE_SUF = re.compile(r"^(\d[\dA-Z]*?)([A-Z]{0,2})$")
+
+def _norm_oem(s):
+    return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())
+
+def _split_base_suf(norm):
+    m = _OEM_BASE_SUF.match(norm)
+    if not m:
+        return norm, ""
+    return m.group(1), m.group(2)
+
+def _oem_families(oem_list, *, min_len=9, min_count=2):
+    """Из сырых OEM -> список 'база + актуальный суффикс', отсортированный по частоте.
+    Один номер в разных формах схлопывается; мусор/обрезки отсекаются."""
+    from collections import Counter
+    bases, base_total = {}, Counter()
+    for raw in oem_list:
+        _mk, num = _split_oem(raw)
+        norm = _norm_oem(num)
+        if len(norm) < min_len:            # обрезки типа 21115562 / 78115561
+            continue
+        base, suf = _split_base_suf(norm)
+        if len(base) < min_len:            # битые базы типа 07815561D (8 цифр)
+            continue
+        bases.setdefault(base, Counter())[suf] += 1
+        base_total[base] += 1
+    if not base_total:
+        return []
+    out = []
+    for i, (base, total) in enumerate(base_total.most_common()):
+        if i > 0 and total < min_count:    # топовое семейство держим всегда
+            continue
+        sufs = bases[base]
+        mx = max(sufs.values())
+        thr = max(min_count, mx * 0.2)     # редкий суффикс (напр. шумный K) выкидываем
+        solid = [s for s, c in sufs.items() if c >= thr] or list(sufs)
+        latest = max(solid, key=lambda s: (len(s), s))  # '' < D < H < J
+        pretty = f"{base[:3]} {base[3:6]} {base[6:]}" if len(base) >= 9 else base
+        out.append((pretty + (" " + latest if latest else "")).strip())
+    return out
+
 def _dedupe_oem(oem_list, car_make=""):
     out, order = {}, []
     for raw in oem_list:
@@ -165,15 +206,20 @@ def format_vin_reply(meta, *, part_label="", brand_filter=None, top_n=5, max_oem
     maybe = [r for r in top
              if (_n(r.get("brand")), _n(r.get("article"))) not in seen]
 
-    # --- OEM: сначала ОДИН ГЛАВНЫЙ, потом остальные ---
+       # --- OEM: сначала ОДИН ГЛАВНЫЙ, потом остальные ---
     oem_main = (summary.get("oem_main") or "").strip()
+
+    # все OEM-номера авто (схлопнутые) — нужно для блока «Другие»
+    oem_show = _collapse_oem([num for _mk, num in _dedupe_oem(oem_raw)])[:max_oem]
+
     if oem_main:
         anchor = [oem_main]
     else:
         deduped = _dedupe_oem(summary.get("anchor_oems") or [])
         anchor = _collapse_oem([num for _mk, num in deduped])[:3]
+        if not anchor:
+            anchor = oem_show[:1]
 
-    # «Другие» — выкидываем тот же базовый номер, что и у главного
     main_base = _oem_base(oem_main)
     rest = [o for o in oem_show
             if o not in anchor and (not main_base or _oem_base(o) != main_base)]
@@ -185,22 +231,31 @@ def format_vin_reply(meta, *, part_label="", brand_filter=None, top_n=5, max_oem
         L.append(f"🛠 Двигатель: {_code(meta['engine_code'])}")
     L.append("━" * 18)
 
-    # --- OEM: сначала ГЛАВНЫЙ (якорь), потом остальные ---
-    deduped = _dedupe_oem(summary.get("anchor_oems") or [])
-    anchor  = _collapse_oem([num for _mk, num in deduped])[:3]
-    rest = [o for o in oem_show if o not in anchor]
+    # --- OEM: один стабильный главный + остальные семейства ---
+    families = _oem_families(oem_raw)
+    oem_main = (summary.get("oem_main") or "").strip()
+    if oem_main:
+        anchor = [oem_main]
+        mk = _norm_oem(oem_main)[:9]
+        rest = [f for f in families if _norm_oem(f)[:9] != mk]
+    elif families:
+        anchor = [families[0]]
+        rest = families[1:]
+    else:
+        anchor, rest = [], []
+    oem_show = families
 
     if anchor:
-        L.append("⭐ <b>Оригинал (наиболее вероятный):</b>")
-        L.append("   " + " · ".join(_code(x) for x in anchor))
+        L.append("⭐ Оригинал (наиболее вероятный): ")
+        L.append(" " + " · ".join(_code(x) for x in anchor))
         if rest:
-            L.append("🔩 <b>Другие OEM-номера:</b>")
-            L.append("   " + " · ".join(_code(x) for x in rest))
+            L.append("🔩 Другие OEM-номера: ")
+            L.append(" " + " · ".join(_code(x) for x in rest))
     elif oem_show:
-        L.append("🔩 <b>Оригинал (OEM):</b>")
-        L.append("   " + " · ".join(_code(x) for x in oem_show))
+        L.append("🔩 Оригинал (OEM): ")
+        L.append(" " + " · ".join(_code(x) for x in oem_show))
     else:
-        L.append("🔩 <b>Оригинал (OEM):</b> не определён")
+        L.append("🔩 Оригинал (OEM): не определён")
     L.append("")
 
     if exact:
