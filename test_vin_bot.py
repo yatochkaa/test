@@ -2639,6 +2639,15 @@ def dedupe_name(s: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 #  КОМАНДЫ
 # ══════════════════════════════════════════════════════════════════
+async def on_error(update, context):
+    logger.exception("Ошибка при обработке апдейта", exc_info=context.error)
+    try:
+        if update and getattr(update, "effective_message", None):
+            await update.effective_message.reply_text(
+                "⚠️ Что-то пошло не так, попробуй ещё раз."
+            )
+    except Exception:
+        pass
 
 async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # NEW: вызов из меню/роутера через user_data (без context.args)
@@ -4029,18 +4038,6 @@ async def _post_init(app) -> None:
         BotCommand("help", "Список запчастей"),
     ])
 
-async def on_error(update, context):
-    log.exception("Ошибка при обработке апдейта", exc_info=context.error)
-    try:
-        if update and getattr(update, "effective_message", None):
-            await update.effective_message.reply_text(
-                "⚠️ Что-то пошло не так, попробуй ещё раз."
-            )
-    except Exception:
-        pass
-
-application.add_error_handler(on_error)
-
 def main():
     for name, val in [
         ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
@@ -4075,8 +4072,22 @@ def main():
     app.add_handler(CommandHandler("debugart", cmd_debugart))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))  # ← НОВОЕ (роутер кнопок/текста, ставить ПОСЛЕДНИМ)
 
+    app.add_error_handler(on_error)
+
     logger.info("Бот запущен.")
     app.run_polling(drop_pending_updates=True)
+    
+async def on_error(update, context):
+    log.exception("Ошибка при обработке апдейта", exc_info=context.error)
+    try:
+        if update and getattr(update, "effective_message", None):
+            await update.effective_message.reply_text(
+                "⚠️ Что-то пошло не так, попробуй ещё раз."
+            )
+    except Exception:
+        pass
+
+application.add_error_handler(on_error)
     
 if __name__ == "__main__":
     main()
