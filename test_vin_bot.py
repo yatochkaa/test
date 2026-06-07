@@ -3967,7 +3967,10 @@ async def _run_vin_text(update, context, text: str) -> None:
     await cmd_vin(update, context)
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip()
+    msg = update.effective_message          # ловит и edited_message
+    if msg is None or not msg.text:
+        return
+    text = msg.text.strip()
     if not text:
         return
 
@@ -4025,6 +4028,18 @@ async def _post_init(app) -> None:
         BotCommand("crosses", "Аналоги по артикулу"),
         BotCommand("help", "Список запчастей"),
     ])
+
+async def on_error(update, context):
+    log.exception("Ошибка при обработке апдейта", exc_info=context.error)
+    try:
+        if update and getattr(update, "effective_message", None):
+            await update.effective_message.reply_text(
+                "⚠️ Что-то пошло не так, попробуй ещё раз."
+            )
+    except Exception:
+        pass
+
+application.add_error_handler(on_error)
 
 def main():
     for name, val in [
