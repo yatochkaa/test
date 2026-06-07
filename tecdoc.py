@@ -84,13 +84,13 @@ _WORKING_CAR_TYPE_ID: Optional[str] = None
 
 _RL_COOLDOWN_UNTIL = 0.0  # monotonic-метка: пока now < этого — API не дёргаем
 _RL_BASE_COOLDOWN = float(os.getenv("TECDOC_RL_COOLDOWN", "90"))  # сек паузы после лимита
-​
-​
+
+
 def _rl_left() -> float:
     """Сколько секунд ещё действует пауза (0 — паузы нет)."""
     return max(0.0, _RL_COOLDOWN_UNTIL - time.monotonic())
-​
-​
+
+
 def _rl_trip(seconds: float = None):
     """Взвести предохранитель: поставить глобальную паузу."""
     global _RL_COOLDOWN_UNTIL
@@ -239,24 +239,24 @@ async def _request(session, method: str, params: Optional[dict] = None,
     key = get_key(method)
     if not key:
         return {"_error": "NO_KEY", "_method": method}
-​
+
     q = {"method": method, "key": key, "lang": _LANG_BY_METHOD.get(method, LANG_CODE)}
     if params:
         q.update({k: str(v) for k, v in params.items() if v is not None})
-​
+
     cache_key = "tecdoc:" + method + ":" + ",".join(
         f"{k}={v}" for k, v in sorted(q.items()) if k != "key")
     if use_cache:
         cached = _cache_get(cache_key)
         if cached is not None:
             return {"_ok": True, "data": cached, "_cached": True, "_method": method}
-​
+
     # ПРЕДОХРАНИТЕЛЬ: если недавно получили лимит/бан — не дёргаем API вообще
     left = _rl_left()
     if left > 0:
         return {"_error": "RATE_LIMIT", "_cooldown": round(left),
                 "_reason": "cooldown", "_method": method}
-​
+
     last_err = None
     for attempt in range(max_retries + 1):
         try:
@@ -264,19 +264,19 @@ async def _request(session, method: str, params: Optional[dict] = None,
             if API_DELAY:
                 delay = API_DELAY * (2 ** attempt) + random.uniform(0.0, 0.3)
                 await asyncio.sleep(delay)
-​
+
             status, text = await asyncio.to_thread(_http_get_urllib, q)
-​
+
             # бан/429/HTML-заглушка → взводим предохранитель, НЕ ретраим
             if _looks_like_ban(status, text):
                 _rl_trip()
                 return {"_error": "RATE_LIMIT", "_status": status,
                         "_cooldown": round(_rl_left()), "_reason": "ban_page",
                         "_method": method}
-​
+
             if status == 404:
                 return {"_error": "NOT_FOUND", "_status": 404, "_method": method}
-​
+
             if status in (401, 403):
                 code = _error_code_from_text(text)
                 if code == 5000:
@@ -284,16 +284,16 @@ async def _request(session, method: str, params: Optional[dict] = None,
                     return {"_error": "RATE_LIMIT", "_status": status,
                             "_cooldown": round(_rl_left()), "_method": method}
                 return {"_error": "AUTH", "_status": status, "_method": method}
-​
+
             if status >= 500:
                 last_err = f"HTTP {status}"
                 continue  # 5xx -> ретрай с backoff
-​
+
             try:
                 data = json.loads(text)
             except Exception:
                 return {"_error": "JSON_ERROR", "_raw": text[:300], "_method": method}
-​
+
             # partsapi иногда отдаёт ошибку телом при 200
             if isinstance(data, dict) and data.get("error_code"):
                 ec = data.get("error_code")
@@ -306,15 +306,15 @@ async def _request(session, method: str, params: Optional[dict] = None,
                     continue
                 return {"_error": "API_ERROR", "_code": ec,
                         "_msg": data.get("message"), "_method": method}
-​
+
             if use_cache:
                 _cache_set(cache_key, data)
             return {"_ok": True, "data": data, "_status": status, "_method": method}
-​
+
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
             last_err = f"{type(e).__name__}: {e}"
             continue
-​
+
     return {"_error": "TIMEOUT_OR_5XX", "_detail": last_err, "_method": method}
 
 
@@ -1258,20 +1258,36 @@ async def enrich_articles_with_oem(session, rows, *, max_calls: int = 8,
         enriched.append(row)
     return enriched
 
+def _is_bundle_article(r: dict) -> bool:
+    """True, если запись — комплект/набор (несколько деталей), а не одиночная.
+    Нужно, чтобы в основной OEM-выдаче не мешались 'комплекты' вместо
+    одной детали (например, комплект свечей вместо одной свечи)."""
+    crit = r.get("criteria") or {}
+    text = " ".join(str(r.get(k, "")) for k in
+                    ("product_name", "name", "brand", "article")).lower()
+    if crit:
+        text += " " + " ".join(f"{k} {v}" for k, v in crit.items()).lower()
+    bundle_markers = (
+        "комплект", "к-кт", "к-т ", "набор", "ремкомплект",
+        " set", "kit", "satz", "（к-т", "(к-т",
+    )
+    return any(m in text for m in bundle_markers)
 
 def build_oem_summary(enriched: list, *, top_n: int = 5,
                       min_oem_support: int = 2) -> dict:
-    """Из обогащённых строк собирает компактную сводку для бота:
-        {"oem_numbers": [...],          # оригинальные номера, по частоте
-         "top": [{brand,article,product_name,criteria}],  # топ аналогов
-         "groups": {ключ_размера: [article,...]}}        # отсев "не того" размера
-    Группировка по ключевым характеристикам (высота/диаметр/резьба) помогает
-    различить два размера одной детали (напр. два масляных фильтра под 1.8T).
-    """
-    # 1) OEM-номера: считаем частоту по премиальным артикулам, сортируем по ней
-    freq: dict[str, int] = {}
-    label: dict[str, str] = {}
-    for r in enriched:
+    """Из обогащённых строк собирает компактную сводку для бота.
+    НОВОЕ: перед сборкой OEM отсеивает многокомпонентные бандлы
+    (деталь+ремень ГРМ), чтобы их чужие OE не ломали якорь."""
+    # 0) ОТСЕВ БАНДЛОВ (новый слой). Если всё оказалось бандлами —
+    #    не отсекаем (лучше показать что-то, чем пустоту).
+    core = [r for r in enriched if not _is_bundle_article(r)]
+    if not core:
+        core = list(enriched)
+
+    # 1) OEM-номера: частота по обогащённым артикулам
+    freq: dict = {}
+    label: dict = {}
+    for r in core:
         for oem in r.get("oem_numbers", []) or []:
             k = _norm(oem)
             if not k:
@@ -1281,8 +1297,7 @@ def build_oem_summary(enriched: list, *, top_n: int = 5,
     oem_sorted = [label[k] for k, _ in sorted(freq.items(),
                   key=lambda kv: (-kv[1], kv[0]))]
 
-    # 2) ЯКОРЬ (Слой 2): OE-номера, общие минимум для N аналогов — это
-    #    вероятный настоящий OE машины. Никто не достиг порога -> топ-3 частых.
+    # 2) ЯКОРЬ: OE-номера, общие минимум для N аналогов
     anchor_keys = {k for k, c in freq.items() if c >= min_oem_support}
     if not anchor_keys and freq:
         anchor_keys = {k for k, _ in sorted(freq.items(),
@@ -1293,7 +1308,7 @@ def build_oem_summary(enriched: list, *, top_n: int = 5,
     def _matches_anchor(r):
         return any(_norm(o) in anchor_keys for o in (r.get("oem_numbers") or []))
     exact_rows = rank_article_rows(
-        [r for r in enriched if r.get("oem_numbers") and _matches_anchor(r)])
+        [r for r in core if r.get("oem_numbers") and _matches_anchor(r)])
 
     def _clean(r, is_exact):
         return {"brand": r.get("brand"), "article": r.get("article"),
@@ -1301,14 +1316,13 @@ def build_oem_summary(enriched: list, *, top_n: int = 5,
                 "criteria": r.get("criteria", {}), "exact": is_exact}
     exact = [_clean(r, True) for r in exact_rows[:top_n]]
 
-    # 4) top = точные сначала, добор премиальными (бот читает top —
-    #    улучшается автоматически, без правок cmd_vin)
+    # 4) top = точные сначала, добор премиальными
     seen = {(c["brand"], c["article"]) for c in exact}
     def _score(r):
         return (1 if _is_premium(r.get("brand")) else 0,
                 1 if r.get("oem_numbers") else 0)
     top_clean = list(exact)
-    for r in sorted(enriched, key=_score, reverse=True):
+    for r in sorted(core, key=_score, reverse=True):
         if len(top_clean) >= top_n:
             break
         key = (r.get("brand"), r.get("article"))
@@ -1317,23 +1331,23 @@ def build_oem_summary(enriched: list, *, top_n: int = 5,
         seen.add(key)
         top_clean.append(_clean(r, False))
 
-    # 3) группировка по "размеру" (ключевые критерии) — для отсева не того варианта
+    # 5) группировка по «размеру» — для отсева не того варианта
     _size_keys = ("высот", "диаметр", "резьб", "height", "diameter", "thread")
-    groups: dict[str, list] = {}
-    for r in enriched:
-        # т��лько обогащённые строки, у которых реально есть размерные критерии
+    groups: dict = {}
+    for r in core:
         crit = r.get("criteria") or {}
         if not crit:
             continue
         sig_parts = [f"{name}={val}" for name, val in crit.items()
                      if any(sk in name.lower() for sk in _size_keys)]
         if not sig_parts:
-            continue  # нет размеров — не можем отнести к конкретному варианту
+            continue
         sig = "; ".join(sorted(sig_parts))
         groups.setdefault(sig, []).append(r.get("article"))
 
     return {"oem_numbers": oem_sorted, "anchor_oems": anchor_oems,
-            "exact": exact, "top": top_clean, "groups": groups}
+            "exact": exact, "top": top_clean, "groups": groups,
+            "_bundles_filtered": len(enriched) - len(core)}
 
 
 async def resolve_oem_detailed(session, vin: str, cat_id: str,
