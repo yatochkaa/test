@@ -99,9 +99,11 @@ def _nice_oem(nums):
     return nice or nums
 
 def _collapse_oem(nums):
-    """'078 115 561 D','078 115 561 H' -> '078 115 561 D/H'."""
     order, groups = [], {}
     for num in nums:
+        if isinstance(num, (tuple, list)):     # ← добавить
+            num = num[-1] if num else ""        # ← из (mk, num) берём num
+        num = str(num)                          # ← добавить
         toks = num.split()
         if len(toks) >= 2:
             stem, last = " ".join(toks[:-1]), toks[-1]
@@ -171,7 +173,18 @@ def format_vin_reply(meta, *, part_label="", brand_filter=None, top_n=5, max_oem
         L.append(f"🛠 Двигатель: {_code(meta['engine_code'])}")
     L.append("━" * 18)
 
-    if oem_show:
+    # --- OEM: сначала ГЛАВНЫЙ (якорь), потом остальные ---
+    deduped = _dedupe_oem(summary.get("anchor_oems") or [])
+    anchor  = _collapse_oem([num for _mk, num in deduped])[:3]
+    rest = [o for o in oem_show if o not in anchor]
+
+    if anchor:
+        L.append("⭐ <b>Оригинал (наиболее вероятный):</b>")
+        L.append("   " + " · ".join(_code(x) for x in anchor))
+        if rest:
+            L.append("🔩 <b>Другие OEM-номера:</b>")
+            L.append("   " + " · ".join(_code(x) for x in rest))
+    elif oem_show:
         L.append("🔩 <b>Оригинал (OEM):</b>")
         L.append("   " + " · ".join(_code(x) for x in oem_show))
     else:
