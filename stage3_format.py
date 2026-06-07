@@ -124,6 +124,13 @@ def _collapse_oem(nums):
             out.append(f"{key} " + "/".join(groups[key]))
     return out
 
+def _oem_base(s):
+    """Базовый номер без хвостовой ревизии: '078 115 561 J' -> '078 115 561'."""
+    toks = str(s or "").split()
+    if len(toks) >= 2 and len(toks[-1]) <= 5 and any(c.isalpha() for c in toks[-1]):
+        return " ".join(toks[:-1])
+    return " ".join(toks)
+
 def format_vin_reply(meta, *, part_label="", brand_filter=None, top_n=5, max_oem=6):
     """meta из resolve_oem_detailed -> готовый HTML-текст для Telegram."""
     head = _e(part_label or "Деталь")
@@ -158,13 +165,18 @@ def format_vin_reply(meta, *, part_label="", brand_filter=None, top_n=5, max_oem
     maybe = [r for r in top
              if (_n(r.get("brand")), _n(r.get("article"))) not in seen]
 
-    deduped = _dedupe_oem(oem_raw, car_make)
-    anchor = [num for mk, num in deduped if mk == car_make]
-    if not anchor and car_make in _VAG:
-        anchor = [num for mk, num in deduped if mk in _VAG]
-    if not anchor:
-        anchor = [num for _mk, num in deduped]
-    oem_show = _collapse_oem(_nice_oem(anchor))[:max_oem]
+    # --- OEM: сначала ОДИН ГЛАВНЫЙ, потом остальные ---
+    oem_main = (summary.get("oem_main") or "").strip()
+    if oem_main:
+        anchor = [oem_main]
+    else:
+        deduped = _dedupe_oem(summary.get("anchor_oems") or [])
+        anchor = _collapse_oem([num for _mk, num in deduped])[:3]
+
+    # «Другие» — выкидываем тот же базовый номер, что и у главного
+    main_base = _oem_base(oem_main)
+    rest = [o for o in oem_show
+            if o not in anchor and (not main_base or _oem_base(o) != main_base)]
 
     L = [f"🔧 <b>{head}</b>"]
     if car:
