@@ -230,7 +230,7 @@ def _http_get_urllib(q):
             body = ""
         return e.code, body          # вернём 401/4xx + тело, _request разберёт сам
     except Exception:
-        return 599, ""               # сеть/таймаут -> уйдёт в ретрай как 5xx
+        return 30, ""               # сеть/таймаут -> уйдёт в ретрай как 5xx
 
 async def _request(session, method: str, params: Optional[dict] = None,
                    *, use_cache: bool = True, max_retries: int = _MAX_RETRIES) -> dict:
@@ -868,6 +868,29 @@ def _match_toks(text, keep_axis: bool = True) -> set:
             continue
         out.add(st)
     return out
+
+def _norm_ru(s: str) -> str:
+    s = (s or "").lower().replace("ё", "е")
+    return re.sub(r"[^a-zа-я0-9]+", " ", s).strip()
+
+def _match_node(tree_nodes, query):
+    """tree_nodes: список (strId, имя) из getSearchTree(lang=16). query: фраза юзера."""
+    q = _norm_ru(query)
+    qw = set(q.split())
+    best = None
+    for str_id, name in tree_nodes:
+        n = _norm_ru(name)
+        if not n:
+            continue
+        if n == q:                       # точное совпадение имени
+            return str_id
+        ov = len(qw & set(n.split()))
+        if not ov:
+            continue
+        score = ov / max(1, len(qw)) + (0.5 if (q in n or n in q) else 0)
+        if best is None or score > best[0]:
+            best = (score, str_id)
+    return best[1] if best else None
 
 def _flatten_tree_paths(node, acc: list) -> None:
     """Как _flatten_tree, но сохраняет полный STR_PATH и уровень (нужно для веток/диск-барабан)."""
