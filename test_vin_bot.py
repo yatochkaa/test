@@ -8,8 +8,10 @@ import json
 import hashlib
 import re
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, BotCommand
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters,
+)
 from parts_resolver import PartsResolver
 import tecdoc
 resolver = PartsResolver("parts")
@@ -2639,21 +2641,23 @@ def dedupe_name(s: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 async def cmd_vin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
-            "❌ Формат: <code>/vin VIN запчасть</code>\n\n"
-            "Примеры:\n"
-            "<code>/vin XW7BF4FK60S145161 воздушный фильтр</code>\n"
-            "<code>/vin XW7BF4FK60S145161 тормозные колодки передние</code>\n"
-            "<code>/vin XW7BF4FK60S145161 амортизатор задний</code>\n"
-            "<code>/vin XW7BF4FK60S145161 шрус внутренний</code>\n\n"
-            "/help — полный список запчастей",
-            parse_mode="HTML",
-        )
-        return
-
-    vin = context.args[0].strip().upper()
-    part_text = " ".join(context.args[1:]).strip()
+    # NEW: вызов из меню/роутера через user_data (без context.args)
+    injected = context.user_data.pop("_vin_query", None) if context.user_data else None
+    if injected:
+        vin, part_text = injected
+    else:
+        if not context.args or len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ Формат: /vin VIN запчасть \n\n"
+                "Примеры:\n"
+                " /vin XW7BF4FK60S145161 воздушный фильтр \n"
+                " /vin XW7BF4FK60S145161 тормозные колодки передние \n\n"
+                "/help — полный список запчастей",
+                parse_mode="HTML",
+            )
+            return
+        vin = context.args[0].strip().upper()
+        part_text = " ".join(context.args[1:]).strip()
 
     if len(vin) != 17:
         await update.message.reply_text(
@@ -3102,35 +3106,45 @@ async def cmd_debugart(update, context):
     await update.message.reply_text(text[:4000])
 
 async def cmd_crosses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "Формат: <code>/crosses артикул</code>\nПример: <code>/crosses 17801-0H030</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    number = " ".join(context.args).strip()
-    await update.message.reply_text(
-        f"🔄 Ищу аналоги: <code>{number}</code>...", parse_mode="HTML"
-    )
-
-    async with aiohttp.ClientSession() as session:
-        raw = await api_get_crosses(session, number)
-        if not raw:
+    injected = context.user_data.pop("_cross_query", None) if context.user_data else None
+    if injected:
+        number = injected.strip()
+    else:
+        if not context.args:
             await update.message.reply_text(
-                f"⚠️ Аналоги для <code>{number}</code> не найдены.", parse_mode="HTML"
+                "Формат: /crosses артикул \nПример: /crosses 17801-0H030 \n"
+                "Или нажмите «🔁 Аналоги по артикулу».",
+                parse_mode="HTML",
             )
             return
-        crosses_all = filter_crosses(raw, number, "")
-        crosses = sort_crosses_by_priority(crosses_all)[:10]
-        lines = [f" • <b>{b}</b> <code>{a}</code>" for b, a in crosses]
+        number = " ".join(context.args).strip()
+
+    await update.message.reply_text(
+        f"🔄 Ищу аналоги: <code>{number}</code>…", parse_mode="HTML"
+    )
+    async with aiohttp.ClientSession() as session:
+        raw = await api_get_crosses(session, number)
+    if not raw:
         await update.message.reply_text(
-            f"🔄 <b>Аналоги <code>{number}</code> "
-            f"(топ-{len(crosses)} из {len(crosses_all)}):</b>\n"
-            + "\n".join(lines)
-            + "\n\n⚠️ <i>Проверяй соответствие перед заказом</i>",
-            parse_mode="HTML",
+            f"⚠️ Аналоги для <code>{number}</code> не найдены.", parse_mode="HTML"
         )
+        return
+    crosses_all = filter_crosses(raw, number, "")
+    crosses = sort_crosses_by_priority(crosses_all)[:10]
+    if not crosses:
+        await update.message.reply_text(
+            f"⚠️ Аналоги для <code>{number}</code> не найдены.", parse_mode="HTML"
+        )
+        return
+    lines = [f"{i}. <b>{b}</b> <code>{a}</code>"
+             for i, (b, a) in enumerate(crosses, 1)]
+    await update.message.reply_text(
+        f"🔁 <b>Аналоги</b> <code>{number}</code> "
+        f"(топ-{len(crosses)} из {len(crosses_all)}):\n"
+        + "\n".join(lines)
+        + "\n\n⚠️ Проверяй соответствие перед заказом.",
+        parse_mode="HTML",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -3874,15 +3888,13 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("mode", None)
     await update.message.reply_text(
-        "👋 <b>VIN-поиск запчастей</b>\n\n"
-        "<code>/vin VIN запчасть</code> — подобрать деталь\n"
-        "<code>/crosses артикул</code> — найти аналоги\n"
-        "<code>/debug</code> — диагностика покрытия / VIN\n"
-        "<code>/debug vin VIN</code> — расшифровка VIN\n"
-        "<code>/debug coverage VIN</code> — покрытие базы\n"
-        "/help — список запчастей",
-        parse_mode="HTML",
+        "👋 <b>Поиск автозапчастей по VIN</b>\n\n"
+        "Выберите действие на клавиатуре ниже 👇\n"
+        "или сразу пришлите <b>VIN деталь</b> — например "
+        "<code>XW7BF4FK60S145161 масляный фильтр</code>.",
+        parse_mode="HTML", reply_markup=main_keyboard(),
     )
 
 
@@ -3905,14 +3917,12 @@ def _build_help_text() -> str:
         names = ", ".join(by_group[gid])
         blocks.append(f"{emoji} <b>{title}:</b>\n  {names}")
 
-    blocks.append("")
-    blocks.append("📋 <b>Использование:</b>")
-    blocks.append("  <code>/vin VIN запчасть</code>")
-    blocks.append("  Пример: <code>/vin XW7BF4FK60S145161 воздушный фильтр</code>")
-    blocks.append("")
-    blocks.append("ℹ️ Для тормозных колодок, дисков, амортизаторов,")
-    blocks.append("    пружин и рычагов поддержано указание <b>передние/задние</b>.")
-    blocks.append("    Без уточнения покажу оба варианта.")
+    blocks.append("📋 <b>Как искать:</b>")
+    blocks.append("  • Кнопка «🔎 Поиск по VIN» → пришлите: VIN деталь")
+    blocks.append("    Пример: <code>XW7BF4FK60S145161 воздушный фильтр</code>")
+    blocks.append("  • Кнопка «🔁 Аналоги по артикулу» → пришлите артикул")
+    blocks.append("    Пример: <code>0451103313</code>")
+    blocks.append("  • Или просто пришлите VIN деталь / артикул — бот поймёт сам.")
     return "\n".join(blocks)
 
 
@@ -3923,10 +3933,103 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  ЗАПУСК
 # ══════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════
+# UI: КНОПКИ / МЕНЮ / РОУТЕР ТЕКСТА (ввод без /vin)
+# ══════════════════════════════════════════════════════════════════
+BTN_VIN   = "🔎 Поиск по VIN"
+BTN_CROSS = "🔁 Аналоги по артикулу"
+BTN_PARTS = "📦 Список запчастей"
+BTN_HELP  = "❓ Помощь"
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[BTN_VIN, BTN_CROSS], [BTN_PARTS, BTN_HELP]],
+        resize_keyboard=True, is_persistent=True,
+        input_field_placeholder="VIN деталь  или  артикул",
+    )
+
+def _looks_like_article(tok: str) -> bool:
+    t = tok.replace("-", "").replace(".", "").replace(" ", "")
+    return 4 <= len(t) <= 20 and any(c.isdigit() for c in t)
+
+async def _run_vin_text(update, context, text: str) -> None:
+    """Парсит 'VIN деталь' и зовёт cmd_vin без /vin."""
+    tokens = text.split()
+    if len(tokens) < 2 or len(tokens[0]) != 17:
+        await update.message.reply_text(
+            "Пришлите в одном сообщении: <b>VIN деталь</b>\n"
+            "Пример: <code>XW7BF4FK60S145161 воздушный фильтр</code>",
+            parse_mode="HTML", reply_markup=main_keyboard(),
+        )
+        return
+    context.user_data["_vin_query"] = (tokens[0].upper(),
+                                       " ".join(tokens[1:]).strip())
+    await cmd_vin(update, context)
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    # 1) Нажатия на кнопки меню
+    if text == BTN_VIN:
+        context.user_data["mode"] = "vin"
+        await update.message.reply_text(
+            "🔎 <b>Поиск по VIN</b>\nПришлите: <b>VIN деталь</b>\n"
+            "Пример: <code>XW7BF4FK60S145161 воздушный фильтр</code>",
+            parse_mode="HTML", reply_markup=main_keyboard(),
+        )
+        return
+    if text == BTN_CROSS:
+        context.user_data["mode"] = "cross"
+        await update.message.reply_text(
+            "🔁 <b>Аналоги по артикулу</b>\nПришлите артикул детали.\n"
+            "Пример: <code>0451103313</code>",
+            parse_mode="HTML", reply_markup=main_keyboard(),
+        )
+        return
+    if text in (BTN_PARTS, BTN_HELP):
+        await cmd_help(update, context)
+        return
+
+    # 2) Режим, выбранный кнопкой
+    mode = context.user_data.get("mode")
+    if mode == "cross":
+        context.user_data["_cross_query"] = text
+        await cmd_crosses(update, context)
+        return
+    if mode == "vin":
+        await _run_vin_text(update, context, text)
+        return
+
+    # 3) Авто-распознавание без режима
+    tokens = text.split()
+    if tokens and len(tokens[0]) == 17 and len(tokens) >= 2:
+        await _run_vin_text(update, context, text)
+        return
+    if len(tokens) == 1 and _looks_like_article(tokens[0]):
+        context.user_data["_cross_query"] = tokens[0]
+        await cmd_crosses(update, context)
+        return
+
+    await update.message.reply_text(
+        "Выберите действие на клавиатуре ниже 👇\n"
+        "или сразу пришлите <b>VIN деталь</b> / <b>артикул</b>.",
+        parse_mode="HTML", reply_markup=main_keyboard(),
+    )
+
+async def _post_init(app) -> None:
+    await app.bot.set_my_commands([
+        BotCommand("start", "Меню и помощь"),
+        BotCommand("vin", "Поиск по VIN: /vin VIN деталь"),
+        BotCommand("crosses", "Аналоги по артикулу"),
+        BotCommand("help", "Список запчастей"),
+    ])
+
 def main():
     for name, val in [
-        ("TELEGRAM_BOT_TOKEN",   TELEGRAM_BOT_TOKEN),
-        ("PARTSAPI_KEY_VIN",     PARTSAPI_KEY_VIN),
+        ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+        ("PARTSAPI_KEY_VIN", PARTSAPI_KEY_VIN),
         ("PARTSAPI_KEY_CROSSES", PARTSAPI_KEY_CROSSES),
     ]:
         if not val:
@@ -3936,7 +4039,6 @@ def main():
         logger.warning("PARTSAPI_KEY_VINDECODE не задан — марка авто не определяется автоматически")
 
     logger.info("API_DELAY = %.2fs (защита от rate-limit)", API_DELAY)
-    # tecdoc будет писать carId/дерево/артикулы в общий cache.json
     tecdoc.set_cache_hooks(cache_get, cache_set)
 
     app = (
@@ -3946,19 +4048,20 @@ def main():
         .read_timeout(30)
         .write_timeout(30)
         .pool_timeout(30)
+        .post_init(_post_init)          # ← НОВОЕ (синее меню команд)
         .build()
     )
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("vin",     cmd_vin))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("vin", cmd_vin))
     app.add_handler(CommandHandler("crosses", cmd_crosses))
-    app.add_handler(CommandHandler("debug",   cmd_debug))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CommandHandler("debugtree", cmd_debugtree))
     app.add_handler(CommandHandler("debugart", cmd_debugart))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))  # ← НОВОЕ (роутер кнопок/текста, ставить ПОСЛЕДНИМ)
 
     logger.info("Бот запущен.")
     app.run_polling(drop_pending_updates=True)
-
-
+    
 if __name__ == "__main__":
     main()
