@@ -1,221 +1,300 @@
 # -*- coding: utf-8 -*-
 """
-test_one_oem.py (v2) — один главный OEM по VIN + детали, с фильтром по марке.
+test_one_oem.py — VIN/carId -> strId -> getArticles -> getArticle -> ГЛАВНЫЙ OEM.
+СТАБИЛЬНО и ОБЩО (не под один VIN/деталь):
+  • узел (strId) резолвится ОФЛАЙН из tecdoc.db (search_trees), а не из живого дерева;
+  • финальный OEM выбирается через collapse_oem: доминирующее семейство + последняя ревизия.
 Запуск:
-    py test_one_oem.py                                  # дефолт: VIN + "масляный фильтр"
-    py test_one_oem.py WAUBH54B11N111054 масляный фильтр
-    py test_one_oem.py WAUBH54B11N111054 100470         # задать strId напрямую
+  py test_one_oem.py <VIN> [<часть|strId>] [car=<carId>] [make=<AUDI|VW|...>]
+Примеры:
+  py test_one_oem.py WAUBH54B11N111054 "масляный фильтр" car=8320 make=AUDI
+  py test_one_oem.py WAUBH54B11N111054 "воздушный фильтр" car=8320 make=AUDI
+  py test_one_oem.py WAUBH54B11N111054 100470 car=8320 make=AUDI
 """
-import os, sys, json, time, re
-import urllib.parse, urllib.request, urllib.error
+import os, re, sys, json, time, sqlite3
+import urllib.request, urllib.parse, urllib.error
 from collections import Counter
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+BASE      = "https://api.partsapi.ru"
+HERE      = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH  = os.path.join(HERE, ".env")
+DB_PATH   = os.path.join(HERE, "tecdoc_db", "tecdoc.db")
+MAX_CALLS = 25
+DELAY     = 0.6
+TIMEOUT   = 25
 
-BASE = "https://api.partsapi.ru/"
-DELAY = 0.6
-MAX_CALLS = 25  # сколько артикулов обогащаем (бережём дневной лимит getArticle)
+# ---------- свой .env-загрузчик (срезает инлайн # и кавычки -> чинит 401) ----------
+def _load_env(path=ENV_PATH):
+    data = {}
+    if not os.path.exists(path):
+        return data
+    with open(path, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            v = re.split(r"\s+#", v.strip(), 1)[0].strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1].strip()
+            data[k.strip()] = v
+    return data
 
-# семейства OE-брендов по марке машины (для фильтра «один OEM, а не куча»)
-OE_FAMILIES = {
-    "VAG": {"VAG", "AUDI", "VW", "VOLKSWAGEN", "SEAT", "SKODA", "AUDI (FAW)", "PORSCHE"},
-    "BMW": {"BMW", "MINI", "ROLLS-ROYCE"},
-    "MERCEDES": {"MERCEDES-BENZ", "MERCEDES", "SMART"},
-    "FORD": {"FORD"},
-    "GM": {"OPEL", "VAUXHALL", "GENERAL MOTORS", "CHEVROLET"},
-    "PSA": {"PEUGEOT", "CITROËN", "CITROEN", "DS"},
-    "RENAULT": {"RENAULT", "DACIA", "NISSAN", "INFINITI"},
-    "TOYOTA": {"TOYOTA", "LEXUS", "DAIHATSU"},
-    "FIAT": {"FIAT", "ALFA ROMEO", "LANCIA", "JEEP"},
-    "HYUNDAI": {"HYUNDAI", "KIA"},
-}
-# по какому слову из VINdecode понять семейство
-MAKE_HINTS = {
-    "AUDI": "VAG", "VOLKSWAGEN": "VAG", "VW": "VAG", "SEAT": "VAG", "SKODA": "VAG", "PORSCHE": "VAG",
-    "BMW": "BMW", "MINI": "BMW",
-    "MERCEDES": "MERCEDES", "SMART": "MERCEDES",
-    "FORD": "FORD",
-    "OPEL": "GM", "VAUXHALL": "GM", "CHEVROLET": "GM",
-    "PEUGEOT": "PSA", "CITRO": "PSA",
-    "RENAULT": "RENAULT", "DACIA": "RENAULT", "NISSAN": "RENAULT",
-    "TOYOTA": "TOYOTA", "LEXUS": "TOYOTA",
-    "FIAT": "FIAT", "ALFA": "FIAT", "LANCIA": "FIAT",
-    "HYUNDAI": "HYUNDAI", "KIA": "HYUNDAI",
-}
+ENV = _load_env()
 
-def env(*names):
+def env(*names, default=""):
     for n in names:
-        if os.getenv(n):
-            return os.getenv(n)
+        v = ENV.get(n) or os.getenv(n)
+        if v:
+            return v.strip()
+    return default
+
+KEY_VIN     = env("PARTSAPI_KEY_VINDECODE21", "PARTSAPI_KEY_VINDECODE")
+KEY_TREE    = env("PARTSAPI_KEY_TREE")
+KEY_ARTS    = env("PARTSAPI_KEY_ARTICLES")
+KEY_ARTICLE = env("PARTSAPI_KEY_GETARTICLE")
+
+def _mask(v):
+    return f"{v[:4]}…{v[-4:]} (len{len(v)})" if v else "—(нет)"
+
+# ---------- HTTP (urllib + UA, как в рабочем ядре) ----------
+def call(params, retries=2):
+    url, last = BASE + "/?" + urllib.parse.urlencode(params), ""
+    for _ in range(retries + 1):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                return r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            last = f"HTTPError: HTTP Error {e.code}: {e.reason}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+        time.sleep(DELAY)
+    print(f"[сеть] {last}")
     return ""
 
-KEY_VIN      = env("PARTSAPI_KEY_VINDECODE21", "PARTSAPI_KEY_VINDECODE")
-KEY_TREE     = env("PARTSAPI_KEY_TREE")
-KEY_ARTICLES = env("PARTSAPI_KEY_ARTICLES")
-KEY_ARTICLE  = env("PARTSAPI_KEY_GETARTICLE")
-
-def call(params, retries=2):
-    url = BASE + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    for attempt in range(retries + 1):
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                body = r.read().decode("utf-8", "replace")
-            time.sleep(DELAY)
-            try:
-                return json.loads(body)
-            except Exception:
-                print(f"   [не JSON] {body[:160]}"); return None
-        except Exception as e:
-            if attempt < retries:
-                time.sleep(1.0); continue
-            print(f"   [сеть] {type(e).__name__}: {e}"); return None
+def call_json(params, retries=2):
+    raw = call(params, retries)
+    try:
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
 
 def as_objs(data):
-    out = []
-    def walk(x):
-        if isinstance(x, dict):
-            if any(k in x for k in ("carId", "STR_ID", "ART_ARTICLE_NR", "OEM_NUMBERS")):
-                out.append(x)
-            for v in x.values(): walk(v)
-        elif isinstance(x, list):
-            for v in x: walk(v)
-    walk(data)
-    return out
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        if isinstance(data.get("result"), (list, dict)):
+            return as_objs(data["result"])
+        objs = [v for v in data.values() if isinstance(v, dict)]
+        return objs or [data]
+    return []
 
 def pick(d, *keys):
     for k in keys:
-        if isinstance(d, dict) and d.get(k) not in (None, ""):
-            return d[k]
-    return None
+        for kk in d:
+            if kk.lower() == k.lower() and d[kk] not in (None, ""):
+                return d[kk]
+    return ""
 
-def detect_family(car):
-    blob = " ".join(str(v) for v in car.values()).upper()
-    for hint, fam in MAKE_HINTS.items():
-        if hint in blob:
-            return fam
-    return None
+# ---------- марки/семейства ----------
+MAKE_HINTS = {"AUDI": "VAG", "VW": "VAG", "VOLKSWAGEN": "VAG", "SEAT": "VAG",
+              "SKODA": "VAG", "PORSCHE": "VAG", "VAG": "VAG"}
+OWN_BRANDS = {"VAG": ("AUDI", "VW", "VOLKSWAGEN", "SEAT", "SKODA", "PORSCHE", "VAG")}
 
-def step_vin(vin):
-    print(f"\n[1] VINdecode {vin}")
-    data = call({"method": "VINdecode", "key": KEY_VIN, "vin": vin, "lang": "ru"})
-    cars = [o for o in as_objs(data) if pick(o, "carId")]
-    if not cars:
-        print("   carId не найден:", json.dumps(data, ensure_ascii=False)[:250]); return None, None
-    car = cars[0]
-    car_id = str(pick(car, "carId"))
-    fam = detect_family(car)
-    print(f"   carId = {car_id}  ({pick(car,'carName','typeName','modelName') or '—'})  семейство OE: {fam or 'не определено'}")
-    return car_id, fam
+# ---------- OEM: разбор + СХЛОПЫВАНИЕ (общее правило) ----------
+_OEM_SPLIT = re.compile(r"[;,]")
+_OEM_SUF   = re.compile(r"^(\d.*?)([A-Z]{0,2})$")
 
-def step_tree(car_id, part, str_override):
-    if str_override:
-        print(f"\n[2] strId задан вручную = {str_override}")
-        return str_override
-    print(f"\n[2] getSearchTree -> ищу точный узел для «{part}»")
-    data = call({"method": "getSearchTree", "key": KEY_TREE,
-                 "lang": "16", "carId": car_id, "carType": "PC"})
-    nodes = [o for o in as_objs(data) if pick(o, "STR_ID")]
-    if not nodes:
-        print("   дерево пустое."); return None
-    toks = [t for t in re.split(r"\s+", part.lower()) if len(t) > 2]
-    # ВСЕ слова запроса должны быть в имени узла -> отсекаем широкий «Фильтр»
-    full = [n for n in nodes if all(t in str(pick(n,"STR_NODE_NAME","STR_PATH") or "").lower() for t in toks)]
-    if full:
-        best = min(full, key=lambda n: len(str(pick(n,"STR_NODE_NAME") or "")))  # самый конкретный
-        print(f"   strId = {pick(best,'STR_ID')}  ({pick(best,'STR_NODE_NAME')})")
-        return str(pick(best, "STR_ID"))
-    # не нашли точный — показываем узлы с «фильтр», чтобы выбрать руками
-    print("   Точный узел не найден. Узлы со словом «фильтр»:")
-    for n in nodes:
-        name = str(pick(n,"STR_NODE_NAME") or "")
-        if "фильтр" in name.lower():
-            print(f"      strId={pick(n,'STR_ID'):<8} {name}")
-    print("   -> перезапусти, добавив нужный strId последним аргументом.")
-    return None
+def _oem_norm(s):
+    return re.sub(r"\s+", "", (s or "").upper())
 
-def step_articles(car_id, str_id):
-    print(f"\n[3] getArticles (strId={str_id})")
-    data = call({"method": "getArticles", "key": KEY_ARTICLES,
-                 "lang": "16", "strId": str_id, "carId": car_id, "carType": "PC"})
-    rows = []
-    for o in as_objs(data):
-        art, sup = pick(o,"ART_ARTICLE_NR","article"), pick(o,"SUP_ID","supId")
-        if art and sup:
-            rows.append({"brand": pick(o,"ART_SUP_BRAND","brand") or "?",
-                         "article": str(art), "sup_id": str(sup)})
-    print(f"   артикулов: {len(rows)}")
-    return rows
-
-OE_SPLIT = re.compile(r"[;,]")
 def parse_oems(s):
-    """-> [(brand_upper, number, display)]"""
     out = []
-    for part in OE_SPLIT.split(str(s or "")):
-        p = part.strip()
-        if not p: continue
+    for chunk in _OEM_SPLIT.split(s or ""):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
         brand = ""
-        if ":" in p:
-            brand, p = p.split(":", 1)
-            brand, p = brand.strip().upper(), p.strip()
-        if p and p not in ("0", "-"):
-            out.append((brand, re.sub(r"[^A-Z0-9]","",p.upper()), p))
+        if ":" in chunk:
+            brand, chunk = chunk.split(":", 1)
+            brand, chunk = brand.strip().upper(), chunk.strip()
+        norm = _oem_norm(chunk)
+        if not norm or set(norm) <= {"0"}:
+            continue
+        out.append((brand, norm, chunk))
     return out
 
+def _split_base(norm):
+    m = _OEM_SUF.match(norm)
+    return (m.group(1), m.group(2)) if m else (norm, "")
+
+def _suf_rank(suf):
+    return (len(suf), suf)   # "" < D < H < J
+
+def collapse_oem(freq):
+    """Берём ДОМИНИРУЮЩЕЕ семейство и его ПОСЛЕДНЮЮ ревизию. Общее, без хардкода."""
+    fams = {}
+    for raw, cnt in freq.items():
+        norm = _oem_norm(raw)
+        if not norm or set(norm) <= {"0"}:
+            continue
+        base, suf = _split_base(norm)
+        f = fams.setdefault(base, {"total": 0, "suf": {}})
+        f["total"] += cnt
+        s = f["suf"].setdefault(suf, {"disp": Counter()})
+        s["disp"][raw.strip()] += cnt
+    if not fams:
+        return None
+    base   = max(fams, key=lambda b: fams[b]["total"])
+    f      = fams[base]
+    latest = max(f["suf"], key=_suf_rank)
+    main   = f["suf"][latest]["disp"].most_common(1)[0][0]
+    older  = [s for s in sorted(f["suf"], key=_suf_rank) if s != latest]
+    return {"main": main, "latest": latest, "older": older, "family_total": f["total"]}
+
+# ---------- strId ОФЛАЙН (общее, для любой детали) ----------
+CAT_TO_STR_ID = {"масляный фильтр": 100470}   # кэш подтверждённых узлов
+
+def _stem(w):
+    return w[:-2] if len(w) > 5 else w
+
+def strid_from_db(part_name):
+    if not os.path.exists(DB_PATH):
+        return []
+    words = [_stem(w) for w in re.split(r"\s+", part_name.lower().strip()) if len(w) > 2] \
+            or [part_name.lower().strip()]
+    where  = " AND ".join("LOWER(col3) LIKE ?" for _ in words)
+    params = [f"%{w}%" for w in words]
+    con = sqlite3.connect(DB_PATH)
+    try:
+        rows = con.execute(
+            f"SELECT col1, col3 FROM search_trees WHERE {where} ORDER BY LENGTH(col3) LIMIT 12",
+            params).fetchall()
+    finally:
+        con.close()
+    seen, out = set(), []
+    for nid, nm in rows:
+        if nid not in seen:
+            seen.add(nid); out.append((nid, nm))
+    return out
+
+def resolve_str_id(part_arg):
+    if part_arg and part_arg.isdigit():
+        return int(part_arg), f"задан вручную = {part_arg}"
+    name = (part_arg or "").lower().strip()
+    if name in CAT_TO_STR_ID:
+        return CAT_TO_STR_ID[name], f"из CAT_TO_STR_ID = {CAT_TO_STR_ID[name]}"
+    cands = strid_from_db(name)
+    if len(cands) == 1:
+        return int(cands[0][0]), f"из офлайн-базы = {cands[0][0]} ({cands[0][1]})"
+    if cands:
+        print("Кандидаты strId из офлайн-базы:")
+        for nid, nm in cands:
+            print(f"  strId={nid}   {nm}")
+        print("-> перезапусти, добавив нужный strId последним аргументом.")
+        return None, "неоднозначно"
+    print(f"Узел для «{name}» не найден в офлайн-базе.")
+    return None, "не найдено"
+
+# ---------- шаги ----------
+def step_vin(vin):
+    print(f"\n[1] VINdecode {vin}")
+    objs = as_objs(call_json({"method": "VINdecode", "key": KEY_VIN, "vin": vin, "lang": "ru"}))
+    if not objs:
+        print("carId не найден: null"); return None, ""
+    car_id = pick(objs[0], "carId", "car_id", "id")
+    make   = pick(objs[0], "manuName", "make", "brand")
+    print(f"carId = {car_id}   марка = {make}")
+    return (int(car_id) if str(car_id).isdigit() else None), str(make).upper()
+
+def step_articles(str_id, car_id):
+    print(f"\n[3] getArticles (strId={str_id})")
+    rows = as_objs(call_json({"method": "getArticles", "key": KEY_ARTS, "lang": "16",
+                              "strId": str(str_id), "carId": str(car_id), "carType": "PC"}))
+    print(f"артикулов: {len(rows)}")
+    return [{"brand": pick(r, "ART_SUP_BRAND", "brand"),
+             "article": pick(r, "ART_ARTICLE_NR", "article"),
+             "sup_id": pick(r, "SUP_ID", "sup_id")} for r in rows]
+
 def step_oem(rows, family):
-    allowed = OE_FAMILIES.get(family) if family else None
-    tag = f"только бренды {family}" if allowed else "без фильтра по марке"
-    print(f"\n[4] getArticle по первым {MAX_CALLS} артикулам ({tag})")
-    freq, label = Counter(), {}
-    for r in rows[:MAX_CALLS]:
-        data = call({"method": "getArticle", "key": KEY_ARTICLE,
-                     "LANG": "16", "ART_NUM": r["article"], "SUP_ID": r["sup_id"]})
-        obj = next(iter(as_objs(data)), None) or (data if isinstance(data, dict) else None)
-        oem_str = pick(obj, "OEM_NUMBERS", "oemNumbers") if obj else None
-        kept = []
-        for brand, k, disp in parse_oems(oem_str):
-            if allowed and brand not in allowed:    # фильтр по марке машины
-                continue
-            if not k: continue
-            freq[k] += 1; kept.append(disp)
-            if k not in label or (" " in disp and " " not in label[k]):
-                label[k] = disp
-        print(f"   {r['brand']:<16}{r['article']:<16} OE(марка): {', '.join(kept) or '—'}")
-    if not freq:
-        print("\n   OEM не собрались (лимит/пусто/всё отфильтровано)."); return
-    print("\n========== РЕЗУЛЬТАТ ==========")
-    top = freq.most_common(6)
-    mk, mc = top[0]
-    print(f"  ⭐ ГЛАВНЫЙ OEM: {label[mk]}   (у {mc} деталей)")
-    if len(top) > 1:
-        print("  другие частые OE:")
-        for k, c in top[1:]:
-            print(f"     {label[k]}  (x{c})")
+    own = OWN_BRANDS.get(family, ())
+    print(f"\n[4] getArticle по первым {MAX_CALLS} артикулам"
+          + (f" (фильтр OE по брендам {family})" if own else ""))
+    freq, calls = Counter(), 0
+    for r in rows:
+        if calls >= MAX_CALLS:
+            break
+        if not r["article"] or not r["sup_id"]:
+            continue
+        calls += 1
+        time.sleep(DELAY)
+        objs = as_objs(call_json({"method": "getArticle", "key": KEY_ARTICLE, "LANG": "16",
+                                  "ART_NUM": r["article"], "SUP_ID": r["sup_id"]}))
+        if not objs:
+            continue
+        oems = parse_oems(pick(objs[0], "OEM_NUMBERS", "oem_numbers"))
+        if own:   # если знаем семейство — оставляем «свои» OE (и без бренда)
+            oems = [t for t in oems if (not t[0] or t[0] in own)]
+        if not oems:
+            continue
+        print(f"{r['brand']:<15} {r['article']:<16} OE: {', '.join(t[2] for t in oems)}")
+        for d in {t[2] for t in oems}:     # +1 за деталь, не за повтор внутри детали
+            freq[d] += 1
+    return freq
 
 def main():
     args = sys.argv[1:]
-    vin = args[0] if args else "WAUBH54B11N111054"
-    rest = args[1:]
-    str_override = None
-    if rest and rest[-1].isdigit():
-        str_override = rest[-1]; rest = rest[:-1]
-    part = " ".join(rest) if rest else "масляный фильтр"
-    miss = [n for n,v in [("VINDECODE21",KEY_VIN),("TREE",KEY_TREE),
-                          ("ARTICLES",KEY_ARTICLES),("GETARTICLE",KEY_ARTICLE)] if not v]
-    if miss:
-        print("Нет ключей в .env:", ", ".join("PARTSAPI_KEY_"+m for m in miss)); return
-    print(f"VIN={vin}  деталь='{part}'" + (f"  strId={str_override}" if str_override else ""))
-    car_id, fam = step_vin(vin)
-    if not car_id: return
-    str_id = step_tree(car_id, part, str_override)
-    if not str_id: return
-    rows = step_articles(car_id, str_id)
-    if not rows: return
-    step_oem(rows, fam)
+    if not args:
+        print("Запуск: py test_one_oem.py <VIN> [<часть|strId>] [car=<carId>] [make=<AUDI>]")
+        return
+    vin, rest = args[0], args[1:]
+    car_override, make_override, part_tokens = None, "", []
+    for a in rest:
+        m = re.match(r"(?:car|carid|car_id)=(\d+)$", a, re.I)
+        if m: car_override = int(m.group(1)); continue
+        m = re.match(r"(?:fam|family|make)=(.+)$", a, re.I)
+        if m: make_override = m.group(1).strip().upper(); continue
+        part_tokens.append(a)
+    part_arg = " ".join(part_tokens).strip() or "масляный фильтр"
+
+    print(f"VIN={vin}  деталь='{part_arg}'")
+    print(f"ключи: VIN= {_mask(KEY_VIN)} | TREE= {_mask(KEY_TREE)} | "
+          f"ARTICLES= {_mask(KEY_ARTS)} | GETARTICLE= {_mask(KEY_ARTICLE)}")
+
+    if car_override:
+        car_id = car_override
+        family = MAKE_HINTS.get(make_override, make_override) or ""
+        print(f"carId(ручной) = {car_id}   семейство = {family or '—'}")
+    else:
+        car_id, make = step_vin(vin)
+        family = MAKE_HINTS.get(make, make) if make else ""
+        if not car_id:
+            print("Без carId дальше нельзя. Укажи car=<carId>."); return
+
+    str_id, how = resolve_str_id(part_arg)
+    print(f"\n[2] strId {how}")
+    if not str_id:
+        return
+
+    rows = step_articles(str_id, car_id)
+    if not rows:
+        print("Нет артикулов — проверь strId/carId."); return
+    freq = step_oem(rows, family)
+
+    print("\n========== РЕЗУЛЬТАТ ==========")
+    col = collapse_oem(freq)
+    if not col:
+        print("OEM не извлечён."); return
+    print(f"⭐ ОРИГИНАЛ для авто: {col['main']}   (актуальная ревизия)")
+    if col["older"]:
+        print("   взаимозаменяемые/устаревшие ревизии: "
+              + ", ".join(s or "(без буквы)" for s in col["older"]))
+    print("\nчастоты:")
+    for disp, n in freq.most_common(8):
+        print(f"  {disp}  (x{n})")
 
 if __name__ == "__main__":
     main()
