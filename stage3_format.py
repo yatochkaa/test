@@ -233,13 +233,8 @@ def format_vin_reply(meta, *, part_label="", brand_filter=None, top_n=5, max_oem
 
     # --- OEM: один стабильный главный + остальные семейства ---
     families = _oem_families(oem_raw)
-    oem_main = (summary.get("oem_main") or "").strip()
-    if oem_main:
-        anchor = [oem_main]
-        mk = _norm_oem(oem_main)[:9]
-        rest = [f for f in families if _norm_oem(f)[:9] != mk]
-    elif families:
-        anchor = [families[0]]
+    if families:
+        anchor = [families[0]]      # доминирующая база + последняя ревизия (J)
         rest = families[1:]
     else:
         anchor, rest = [], []
