@@ -1,99 +1,67 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# ЭТАП 3 — КАЧЕСТВО ВЫДАЧИ (HTML-формат ответа) — v2
-# ============================================================
-# format_vin_reply(meta, part_label=..., brand_filter=None) -> готовый HTML.
+# ЭТАП 3 — КАЧЕСТВО ВЫДАЧИ (HTML) — v3 (читаемое оформление)
+# format_vin_reply(meta, part_label=..., brand_filter=None) -> HTML
 # ОТПРАВЛЯТЬ С parse_mode="HTML".
-#
-# v2 изменения:
-#   • OEM дедуплицируются по номеру (4B0 698 151 AB не повторяется 3 раза)
-#   • "Вероятный OEM" — только по марке авто (чужие ALFA/FIAT убираются)
-#   • критерии без "[мм]" и в полезном порядке (Высота/Ширина/...)
 # ============================================================
-
 import re
 from html import escape
 
-# Группа VAG — взаимозаменяемые марки (один концерн).
 _VAG = {"AUDI", "VW", "VOLKSWAGEN", "SKODA", "SEAT", "CUPRA", "PORSCHE"}
 
-
 def _n(s):
-    """Нормализация для сравнения брендов/номеров."""
     return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())
 
-
 def _e(s):
-    """HTML-escape произвольного текста."""
     return escape(str(s or ""), quote=False)
-
 
 def _code(s):
     return f"<code>{_e(s)}</code>"
 
-
 def _clean_key(name):
-    """'Высота [мм]' -> 'Высота'."""
     return re.sub(r"\s*\[[^\]]*\]", "", str(name or "")).strip()
 
+# ── размеры (показываем у каждого аналога) ──
+_HEIGHT_RE = re.compile(r"высот", re.I)
+_THREAD_RE = re.compile(r"резьб", re.I)
+_OD_RE     = re.compile(r"наружн.*диаметр", re.I)
 
-_SIDE_KEYS = ("сторона установки", "ось установки", "монтажная сторона")
-_SIZE_KEYS = ("высота", "диаметр", "резьба", "ширина", "длина", "толщина")
-# Порядок показа размеров (самое полезное для подбора — первым).
-_SIZE_ORDER = ("высота", "ширина", "длина", "диаметр", "толщина", "резьба")
-
-
-def _side_of(crit):
+def _crit_find(crit, rx, skip=("упаков",)):
     if not crit:
         return None
     for name, val in crit.items():
-        if any(k in str(name).lower() for k in _SIDE_KEYS):
+        low = str(name).lower()
+        if any(s in low for s in skip):
+            continue
+        if rx.search(low):
             return str(val)
     return None
 
+def _dims_brief(crit):
+    """высота · ⌀ нар. · резьба — компактно (у аналогов отличаются)."""
+    parts = []
+    h = _crit_find(crit, _HEIGHT_RE)
+    if h:
+        parts.append(f"высота {h}")
+    od = _crit_find(crit, _OD_RE)
+    if od:
+        parts.append(f"⌀ {od}")
+    thr = _crit_find(crit, _THREAD_RE)
+    if thr:
+        parts.append(f"резьба {thr}")
+    return " · ".join(parts)
 
-def _size_brief(crit, limit=3):
-    if not crit:
-        return ""
-    found = []
-    for name, val in crit.items():
-        if any(k in str(name).lower() for k in _SIZE_KEYS):
-            found.append((_clean_key(name), str(val)))
-
-    def _rank(item):
-        low = item[0].lower()
-        for i, k in enumerate(_SIZE_ORDER):
-            if k in low:
-                return i
-        return len(_SIZE_ORDER)
-
-    found.sort(key=_rank)
-    return "; ".join(f"{n}={v}" for n, v in found[:limit])
-
-
-def _line(item):
-    """Бренд + <code>артикул</code> + название + [сторона; размеры]."""
-    brand = _e(item.get("brand"))
-    art = _code(item.get("article"))
-    name = str(item.get("product_name") or "")
-    if len(name) > 46:
-        name = name[:45].rstrip() + "…"
-    name_s = f" — {_e(name)}" if name else ""
-    crit = item.get("criteria") or {}
-    tags = []
-    side = _side_of(crit)
-    if side:
-        tags.append(_e(side))
-    size = _size_brief(crit)
-    if size:
-        tags.append(_e(size))
-    tail = f"  [{'; '.join(tags)}]" if tags else ""
-    return f"  • <b>{brand}</b> {art}{name_s}{tail}"
-
+def _line(idx, item):
+    brand = _e((item.get("brand") or "").strip())
+    art = _code((item.get("article") or "").strip())
+    dims = _dims_brief(item.get("criteria") or {})
+    head = f"{idx}. <b>{brand}</b> {art}"
+    if dims:
+        return head + f"\n     <i>{_e(dims)}</i>"
+    return head
 
 def _brand_match(item, nb):
     return _n(item.get("brand")) == nb or (nb and nb in _n(item.get("brand")))
-
 
 def _car_make(meta):
     b = str(meta.get("brand") or "").strip().upper()
@@ -103,21 +71,16 @@ def _car_make(meta):
     toks = car.split()
     return toks[0].upper() if toks else ""
 
-
+# ── OEM: дедуп + чистка + схлопывание ──
 def _split_oem(s):
-    """'AUDI: 4B0 698 151 AB' -> ('AUDI', '4B0 698 151 AB'); '078...' -> ('', '078...')."""
     s = str(s or "").strip()
     if ":" in s:
         mk, num = s.split(":", 1)
         return mk.strip().upper(), num.strip()
     return "", s
 
-
 def _dedupe_oem(oem_list, car_make=""):
-    """Дедуп по номеру. Возвращает упорядоченный list[(make, num)].
-    Если один номер встречается под разными марками — предпочитаем марку авто."""
-    out = {}
-    order = []
+    out, order = {}, []
     for raw in oem_list:
         mk, num = _split_oem(raw)
         k = _n(num)
@@ -130,9 +93,36 @@ def _dedupe_oem(oem_list, car_make=""):
             out[k] = [mk, num]
     return [tuple(out[k]) for k in order]
 
+def _nice_oem(nums):
+    """Выкидываем мусорные усечённые номера без пробелов (07815561D и т.п.)."""
+    nice = [x for x in nums if (" " in x) or len(_n(x)) >= 10]
+    return nice or nums
 
-def format_vin_reply(meta, *, part_label="", brand_filter=None,
-                     top_n=5, max_oem=8):
+def _collapse_oem(nums):
+    """'078 115 561 D','078 115 561 H' -> '078 115 561 D/H'."""
+    order, groups = [], {}
+    for num in nums:
+        toks = num.split()
+        if len(toks) >= 2:
+            stem, last = " ".join(toks[:-1]), toks[-1]
+            if stem not in groups:
+                groups[stem] = []
+                order.append(stem)
+            if isinstance(groups[stem], list) and last not in groups[stem]:
+                groups[stem].append(last)
+        else:
+            if num not in groups:
+                groups[num] = None
+                order.append(num)
+    out = []
+    for key in order:
+        if groups[key] is None:
+            out.append(key)
+        else:
+            out.append(f"{key} " + "/".join(groups[key]))
+    return out
+
+def format_vin_reply(meta, *, part_label="", brand_filter=None, top_n=5, max_oem=6):
     """meta из resolve_oem_detailed -> готовый HTML-текст для Telegram."""
     head = _e(part_label or "Деталь")
     car = _e(meta.get("car_str") or "")
@@ -156,7 +146,6 @@ def format_vin_reply(meta, *, part_label="", brand_filter=None,
     exact = list(summary.get("exact") or [])
     top = list(summary.get("top") or [])
     oem_raw = list(summary.get("oem_numbers") or [])
-    groups = summary.get("groups") or {}
 
     if brand_filter:
         nb = _n(brand_filter)
@@ -167,75 +156,55 @@ def format_vin_reply(meta, *, part_label="", brand_filter=None,
     maybe = [r for r in top
              if (_n(r.get("brand")), _n(r.get("article"))) not in seen]
 
-    # — OEM: дедуп по номеру, марка авто вперёд —
     deduped = _dedupe_oem(oem_raw, car_make)
-
-    def _grp_rank(mn):
-        mk = mn[0]
-        if mk == car_make:
-            return 0
-        if mk in _VAG and car_make in _VAG:
-            return 1
-        return 2
-
-    main = sorted(deduped, key=_grp_rank)
-    # "Вероятный OEM этой машины" = только номера своей марки.
-    anchor = [num for mk, num in deduped if mk == car_make][:5]
+    anchor = [num for mk, num in deduped if mk == car_make]
     if not anchor and car_make in _VAG:
-        anchor = [num for mk, num in deduped if mk in _VAG][:5]
+        anchor = [num for mk, num in deduped if mk in _VAG]
+    if not anchor:
+        anchor = [num for _mk, num in deduped]
+    oem_show = _collapse_oem(_nice_oem(anchor))[:max_oem]
 
-    lines = [f"🔧 <b>{head}</b>"]
+    L = [f"🔧 <b>{head}</b>"]
     if car:
-        lines.append(f"🚗 {car}")
+        L.append(f"🚗 <b>{car}</b>")
     if meta.get("engine_code"):
-        lines.append(f"Двигатель: {_code(meta['engine_code'])}")
-    lines.append("─" * 24)
+        L.append(f"🛠 Двигатель: {_code(meta['engine_code'])}")
+    L.append("━" * 18)
 
-    if main:
-        lines.append("⚙️ <b>Оригинал (OEM):</b>")
-        lines.append("  " + ", ".join(_code(num) for _mk, num in main[:max_oem]))
-        if anchor:
-            lines.append("⚓ Вероятный OEM этой машины: "
-                         + ", ".join(_code(x) for x in anchor))
+    if oem_show:
+        L.append("🔩 <b>Оригинал (OEM):</b>")
+        L.append("   " + " · ".join(_code(x) for x in oem_show))
     else:
-        lines.append("⚙️ <b>Оригинал (OEM):</b> не определён")
-    lines.append("")
+        L.append("🔩 <b>Оригинал (OEM):</b> не определён")
+    L.append("")
 
     if exact:
-        lines.append("✅ <b>Точно подходят</b> (по OEM-якорю):")
-        for r in exact[:top_n]:
-            lines.append(_line(r))
-        lines.append("")
+        L.append("✅ <b>Рекомендуем</b> "
+                 "<i>(сверьте размеры — у аналогов отличаются)</i>")
+        for i, r in enumerate(exact[:top_n], 1):
+            L.append(_line(i, r))
+        L.append("")
 
     if maybe:
-        title = ("📋 <b>Возможные аналоги:</b>" if exact
-                 else "📋 <b>Подходящие</b> (якорь не найден):")
-        lines.append(title)
-        for r in maybe[:top_n]:
-            lines.append(_line(r))
-        lines.append("")
+        title = ("🔁 <b>Другие аналоги</b>" if exact
+                 else "🔁 <b>Подходящие</b> <i>(точный якорь не найден)</i>")
+        L.append(title)
+        for i, r in enumerate(maybe[:top_n], 1):
+            L.append(_line(i, r))
+        L.append("")
 
     if not exact and not maybe:
         if brand_filter:
-            lines.append(f"⚠️ По бренду <b>{_e(brand_filter)}</b> ничего не нашлось. "
-                         "Попробуй без фильтра бренда.")
+            L.append(f"⚠️ По бренду {_e(brand_filter)} ничего не нашлось. "
+                     "Попробуй без фильтра бренда.")
         else:
-            lines.append("⚠️ Не удалось подобрать аналоги.")
+            L.append("⚠️ Не удалось подобрать аналоги.")
 
-    if len(groups) > 1:
-        lines.append("📐 <b>Разные размеры/исполнения</b> — сверьте со старой деталью:")
-        for sig, arts in list(groups.items())[:4]:
-            ex = ", ".join(_code(a) for a in arts[:3])
-            lines.append(f"  – {_e(_clean_key(sig))}: {len(arts)} шт (напр. {ex})")
-        lines.append("")
-
-    lines.append("ℹ️ <i>Сверяйте OEM с маркировкой на старой детали перед покупкой.</i>")
-    return "\n".join(lines).rstrip()
-
+    L.append("ℹ️ Сверяйте OEM с маркировкой на старой детали перед покупкой.")
+    return "\n".join(L).rstrip()
 
 # ============================================================
-# ОПЦИОНАЛЬНО: распознавание бренда из запроса
-# "свечи зажигания NGK" -> ("свечи зажигания", "NGK")
+# Распознавание бренда из запроса (без изменений)
 # ============================================================
 _KNOWN_BRANDS = ("NGK", "DENSO", "BOSCH", "BERU", "CHAMPION", "MANN",
                  "MAHLE", "KNECHT", "FILTRON", "HENGST", "FEBI", "SACHS",
@@ -245,9 +214,7 @@ _KNOWN_BRANDS = ("NGK", "DENSO", "BOSCH", "BERU", "CHAMPION", "MANN",
                  "RUVILLE", "VAICO", "SWAG", "MEYLE", "UFI", "PURFLUX",
                  "SOFIMA", "WIX", "FERODO")
 
-
 def extract_brand_from_query(part_text):
-    """'свечи зажигания NGK' -> ('свечи зажигания', 'NGK'). Нет бренда -> (text, None)."""
     if not part_text:
         return part_text, None
     tokens = str(part_text).split()
