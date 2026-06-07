@@ -34,7 +34,7 @@ def _load_env(path=ENV_PATH):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            v = re.split(r"\s+#", v.strip(), 1)[0].strip()
+            v = re.split(r"\s+#", v.strip(), maxsplit=1)[0].strip()
             if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
                 v = v[1:-1].strip()
             data[k.strip()] = v
@@ -134,8 +134,8 @@ def _split_base(norm):
 def _suf_rank(suf):
     return (len(suf), suf)   # "" < D < H < J
 
-def collapse_oem(freq):
-    """Берём ДОМИНИРУЮЩЕЕ семейство и его ПОСЛЕДНЮЮ ревизию. Общее, без хардкода."""
+def collapse_oem(freq, min_share=0.2, min_count=2):
+    """Доминирующее семейство → последняя НАДЁЖНАЯ ревизия (единичный шум вроде 'K' отсекаем)."""
     fams = {}
     for raw, cnt in freq.items():
         norm = _oem_norm(raw)
@@ -144,42 +144,74 @@ def collapse_oem(freq):
         base, suf = _split_base(norm)
         f = fams.setdefault(base, {"total": 0, "suf": {}})
         f["total"] += cnt
-        s = f["suf"].setdefault(suf, {"disp": Counter()})
+        s = f["suf"].setdefault(suf, {"n": 0, "disp": Counter()})
+        s["n"] += cnt
         s["disp"][raw.strip()] += cnt
     if not fams:
         return None
-    base   = max(fams, key=lambda b: fams[b]["total"])
-    f      = fams[base]
-    latest = max(f["suf"], key=_suf_rank)
-    main   = f["suf"][latest]["disp"].most_common(1)[0][0]
-    older  = [s for s in sorted(f["suf"], key=_suf_rank) if s != latest]
+    base = max(fams, key=lambda b: fams[b]["total"])
+    f = fams[base]
+    mx  = max(s["n"] for s in f["suf"].values())
+    thr = max(min_count, mx * min_share)               # порог поддержки
+    solid = {suf: s for suf, s in f["suf"].items() if s["n"] >= thr} or f["suf"]
+    latest = max(solid, key=_suf_rank)                 # среди надёжных — самая свежая
+    main   = solid[latest]["disp"].most_common(1)[0][0]
+    older  = [s for s in sorted(solid, key=_suf_rank) if s != latest]
     return {"main": main, "latest": latest, "older": older, "family_total": f["total"]}
 
-# ---------- strId ОФЛАЙН (общее, для любой детали) ----------
-CAT_TO_STR_ID = {"масляный фильтр": 100470}   # кэш подтверждённых узлов
+# дерево в базе на АНГЛИЙСКОМ -> переводим ключевые слова детали
+RU_EN = {
+    "масл": "oil", "воздуш": "air", "топлив": "fuel", "горюч": "fuel",
+    "салон": "cabin", "филь": "filter", "свеч": "spark",
+    "тормоз": "brake", "диск": "disc", "колодк": "pad",
+}
+def _en_terms(part_name):
+    out = []
+    for w in re.split(r"\s+", part_name.lower().strip()):
+        if len(w) < 3:
+            continue
+        out.append(next((en for ru, en in RU_EN.items() if w.startswith(ru)), w))
+    return out
 
-def _stem(w):
-    return w[:-2] if len(w) > 5 else w
+# легковая группа-узел "Filters" (родитель масл/возд/топл/охл/гидро)
+PC_FILTER_GROUP = "100005"
+
+# проверенные постоянные strId (глобальные ID, находятся один раз и работают всегда)
+CAT_TO_STR_ID = {
+    "масляный фильтр":  100470,   # проверено: 141 артикул
+    "воздушный фильтр": 100260,   # Air Filter  (группа Filters)
+    "топливный фильтр": 100261,   # Fuel Filter (группа Filters)
+}
 
 def strid_from_db(part_name):
+    """Кандидаты (strId, parent, имя) из ОФЛАЙН search_trees (англ. имена в col3)."""
     if not os.path.exists(DB_PATH):
         return []
-    words = [_stem(w) for w in re.split(r"\s+", part_name.lower().strip()) if len(w) > 2] \
-            or [part_name.lower().strip()]
-    where  = " AND ".join("LOWER(col3) LIKE ?" for _ in words)
-    params = [f"%{w}%" for w in words]
+    terms = _en_terms(part_name)
+    if not terms:
+        return []
+    where  = " AND ".join("LOWER(col3) LIKE ?" for _ in terms)
+    params = [f"%{t}%" for t in terms]
     con = sqlite3.connect(DB_PATH)
     try:
         rows = con.execute(
-            f"SELECT col1, col3 FROM search_trees WHERE {where} ORDER BY LENGTH(col3) LIMIT 12",
-            params).fetchall()
+            f"SELECT col1, col2, col3 FROM search_trees WHERE {where} LIMIT 50", params
+        ).fetchall()
     finally:
         con.close()
     seen, out = set(), []
-    for nid, nm in rows:
+    for nid, parent, nm in rows:
         if nid not in seen:
-            seen.add(nid); out.append((nid, nm))
+            seen.add(nid); out.append((str(nid), str(parent), nm))
     return out
+
+def _score_node(nid, parent, name, terms):
+    s = 0
+    if parent == PC_FILTER_GROUP:                s += 100   # каноничная легковая группа
+    if nid.startswith("100"):                    s += 30    # диапазон легковых авто
+    if name.strip().lower() == " ".join(terms):  s += 50    # точное имя ("air filter")
+    s -= len(name)                                          # короче имя = ближе к базовому узлу
+    return s
 
 def resolve_str_id(part_arg):
     if part_arg and part_arg.isdigit():
@@ -187,17 +219,13 @@ def resolve_str_id(part_arg):
     name = (part_arg or "").lower().strip()
     if name in CAT_TO_STR_ID:
         return CAT_TO_STR_ID[name], f"из CAT_TO_STR_ID = {CAT_TO_STR_ID[name]}"
+    terms = _en_terms(name)
     cands = strid_from_db(name)
-    if len(cands) == 1:
-        return int(cands[0][0]), f"из офлайн-базы = {cands[0][0]} ({cands[0][1]})"
-    if cands:
-        print("Кандидаты strId из офлайн-базы:")
-        for nid, nm in cands:
-            print(f"  strId={nid}   {nm}")
-        print("-> перезапусти, добавив нужный strId последним аргументом.")
-        return None, "неоднозначно"
-    print(f"Узел для «{name}» не найден в офлайн-базе.")
-    return None, "не найдено"
+    if not cands:
+        print(f"Узел для «{name}» не найден в офлайн-базе.")
+        return None, "не найдено"
+    nid, parent, nm = max(cands, key=lambda c: _score_node(c[0], c[1], c[2], terms))
+    return int(nid), f"авто-выбор = {nid} ({nm}, parent {parent})"
 
 # ---------- шаги ----------
 def step_vin(vin):
