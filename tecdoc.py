@@ -885,27 +885,21 @@ def _flatten_tree_paths(node, acc: list) -> None:
             if isinstance(v, (list, dict)):
                 _flatten_tree_paths(v, acc)
 
+# Подтверждённые узлы дерева (легковые, группа Filters=100005) — сверены вживую:
+#   масляный 100470 -> 078 115 561 J ; воздушный 100260 -> 058 133 843 (= сайт 2фильтр)
+# Матч по подстрокам основы слова — устойчив к падежам и порядку слов.
+_NAME_TO_STR_ID = [
+    (("масл", "фильтр"), 100470),
+    (("воздуш", "фильтр"), 100260),
+    (("топлив", "фильтр"), 100261),
+]
 
-# =============================================================================
-# ИНСТРУКЦИЯ (читай 2 шага):
-#
-# ШАГ 1. В САМОМ ВЕРХУ файла tecdoc.py (рядом с другими import)
-#         добавь эти 4 строки:
-#
-#             try:
-#                 from parts_resolver_map import resolve as _pr_resolve
-#             except Exception:
-#                 _pr_resolve = None
-#
-# ШАГ 2. Найди в tecdoc.py свою старую функцию:
-#             async def resolve_str_id(...):
-#                 ... до строки ...
-#                 return best_id
-#         ВЫДЕЛИ ЕЁ ЦЕЛИКОМ (от "async def resolve_str_id"
-#         до "return best_id" включительно), УДАЛИ и вставь
-#         вместо неё всё, что ниже этой рамки.
-# =============================================================================
-
+def _str_id_by_name(part_name: str) -> Optional[int]:
+    s = (part_name or "").lower().replace("ё", "е")
+    for needles, sid in _NAME_TO_STR_ID:
+        if all(n in s for n in needles):
+            return sid
+    return None
 
 async def resolve_str_id(session, car_id: int, cat_id: str,
                          part_name: str = "", keywords: Optional[list] = None) -> Optional[int]:
@@ -916,6 +910,11 @@ async def resolve_str_id(session, car_id: int, cat_id: str,
     # 1) уже известный cat_id
     if cat_id in CAT_TO_STR_ID:
         return CAT_TO_STR_ID[cat_id]
+        
+    # 1.5) подтверждённые узлы по русскому названию детали (офлайн-валидация)
+    _sid = _str_id_by_name(part_name)
+    if _sid:
+        return _sid
 
     q = (part_name or "").lower().strip()
     if q in _MATCH_HARD:
@@ -1273,6 +1272,53 @@ def _is_bundle_article(r: dict) -> bool:
     )
     return any(m in text for m in bundle_markers)
 
+# --- Схлопывание OEM до ОДНОГО оригинала: доминирующее семейство + свежая ревизия ---
+_OEM_SPLIT = re.compile(r"^(\d[\dA-Z]*?)([A-Z]{1,2})$")
+
+def _oem_base_suf(norm_oem: str) -> tuple:
+    """'078115561J' -> ('078115561','J'); '058133843' -> ('058133843','')."""
+    m = _OEM_SPLIT.match(norm_oem or "")
+    return (m.group(1), m.group(2)) if m else (norm_oem or "", "")
+
+def _suf_rank(suf: str) -> tuple:
+    """Порядок ревизий: '' < 'A' < ... < 'J' < 'AA'. Длиннее/старше буква = новее."""
+    return (len(suf), suf)
+
+def collapse_oem(freq: dict, label: dict | None = None,
+                 *, min_share: float = 0.2, min_count: int = 2) -> dict:
+    """freq: {норм_OEM: счётчик}, label: {норм_OEM: красивая_строка}.
+    1) группируем по базовому номеру (без буквенного суффикса ревизии);
+    2) доминирующее семейство = максимум по сумме частот;
+    3) внутри берём последнюю НАДЁЖНУЮ ревизию — редкие суффиксы-шум
+       (< max(min_count, max_freq*min_share)) отсекаются, чтобы не выбрать
+       случайный 'K' с одним упоминанием.
+    -> {main, main_key, base, latest_suffix, family_total, older_suffixes}.
+    """
+    if not freq:
+        return {}
+    label = label or {}
+    fam: dict = {}
+    for k, c in freq.items():
+        base, suf = _oem_base_suf(k)
+        fam.setdefault(base, {})
+        fam[base][suf] = fam[base].get(suf, 0) + c
+    base = max(fam, key=lambda b: sum(fam[b].values()))
+    sufs = fam[base]
+    mx = max(sufs.values())
+    thr = max(min_count, mx * min_share)
+    solid = {s: c for s, c in sufs.items() if c >= thr} or sufs
+    latest = max(solid, key=_suf_rank)
+    main_key = base + latest
+    return {
+        "main": label.get(main_key, main_key),
+        "main_key": main_key,
+        "base": base,
+        "latest_suffix": latest,
+        "family_total": sum(sufs.values()),
+        "older_suffixes": sorted((s for s in sufs if s != latest),
+                                 key=_suf_rank, reverse=True),
+    }
+
 def build_oem_summary(enriched: list, *, top_n: int = 5,
                       min_oem_support: int = 2) -> dict:
     """Из обогащённых строк собирает компактную сводку для бота.
@@ -1345,7 +1391,9 @@ def build_oem_summary(enriched: list, *, top_n: int = 5,
         sig = "; ".join(sorted(sig_parts))
         groups.setdefault(sig, []).append(r.get("article"))
 
-    return {"oem_numbers": oem_sorted, "anchor_oems": anchor_oems,
+    collapsed = collapse_oem(freq, label)
+    return {"oem_numbers": oem_sorted, "oem_main": collapsed.get("main"),
+            "oem_collapsed": collapsed, "anchor_oems": anchor_oems,
             "exact": exact, "top": top_clean, "groups": groups,
             "_bundles_filtered": len(enriched) - len(core)}
 
