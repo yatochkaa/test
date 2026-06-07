@@ -4077,17 +4077,5 @@ def main():
     logger.info("Бот запущен.")
     app.run_polling(drop_pending_updates=True)
     
-async def on_error(update, context):
-    log.exception("Ошибка при обработке апдейта", exc_info=context.error)
-    try:
-        if update and getattr(update, "effective_message", None):
-            await update.effective_message.reply_text(
-                "⚠️ Что-то пошло не так, попробуй ещё раз."
-            )
-    except Exception:
-        pass
-
-application.add_error_handler(on_error)
-    
 if __name__ == "__main__":
     main()
